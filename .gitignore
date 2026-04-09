@@ -1,0 +1,158 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual Environment
+.venv/
+venv/
+ENV/
+env/
+.virtualenv/
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Jupyter Notebook
+.ipynb_checkpoints
+*.ipynb_checkpoints/
+
+# Project specific directories
+/data/
+/build/
+/local/
+/install/
+/download/
+models/
+outputs/
+/output/
+tmp/
+
+# Model files
+*.onnx
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+db/*.db
+pollux.db
+
+# Audio files (if not needed in repo)
+*.wav
+*.mp3
+*.ogg
+*.flac
+
+# Logs
+*.log
+logs/
+*.out
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.hypothesis/
+
+# MyPy
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# Environment variables
+.env
+.env.local
+
+# OS
+.DS_Store
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# Temporary files
+*.tmp
+*.temp
+*.bak
+*.cache
+
+# Training artifacts
+lightning_logs/
+wandb/
+tensorboard/
+
+# Compiled C++
+*.o
+*.obj
+*.exe
+*.out
+*.app
+
+# Node modules (if any JS tooling)
+node_modules/
+
+# Package manager
+*.lock
+poetry.lock
+Pipfile.lock
+echo "web_ui/models/*.onnx" >> .gitignore
+echo "web_ui/models/*.onnx.json" >> .gitignore
+echo "web_ui/outputs/" >> .gitignore
+@"
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+
+# Models - downloaded at runtime
+web_ui/models/*.onnx
+web_ui/models/*.onnx.json
+web_ui/models/voices.json
+
+# Outputs
+web_ui/outputs/
+*.wav
+*.mp3
+
+# Database
+*.db
+*.sqlite3
+
+# IDE & OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+"@ | Out-File -FilePath .gitignore -Encoding UTF8

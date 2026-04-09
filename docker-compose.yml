@@ -1,0 +1,15 @@
+services:
+  pollux:
+    build:
+      context: .
+      dockerfile: Dockerfile.prod
+    container_name: pollux
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      - "127.0.0.1:8000:8000"
+    volumes:
+      - ./web_ui/outputs:/app/web_ui/outputs
+      - ./web_ui/models:/app/web_ui/models
+      - ./web_ui/pollux.db:/app/web_ui/pollux.db
