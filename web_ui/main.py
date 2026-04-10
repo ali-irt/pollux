@@ -53,10 +53,7 @@ app.state.limiter = limiter
 # CORS Configuration - HARDENED
 # ---------------------------------------------------------------------------
 
-ALLOWED_ORIGINS = [
-    os.environ.get("ALLOWED_ORIGIN_1", "https://pollux.example.com"),
-    os.environ.get("ALLOWED_ORIGIN_2", "https://app.pollux.example.com"),
-]
+ALLOWED_ORIGINS = ["*"]
 
 # Add development origins only in dev mode
 if os.environ.get("ENVIRONMENT") == "development":
