@@ -1086,8 +1086,8 @@ class MusicGenerateRequest(BaseModel):
 
 @app.post("/api/generate_music", summary="Generate music from a text prompt (premium)")
 def generate_music(request: MusicGenerateRequest, user=Depends(get_current_user)):
-    if not user["is_premium"]:
-        premium_feature_error("Music generation")
+    # if not user["is_premium"]:
+    #     premium_feature_error("Music generation")
     
     if not request.prompt or not request.prompt.strip():
         raise HTTPException(status_code=400, detail="Prompt cannot be empty.")
