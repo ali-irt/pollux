@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(grep -n \"app.mount\\\\|app.get.*html\\\\|index.html\\\\|StaticFiles\\\\|@app.get.*/$\" d:/pollux-main/web_ui/main.py)",
+      "Bash(python3 -c \"import sys,json; d=json.load\\(sys.stdin\\); k=list\\(d.keys\\(\\)\\)[:3]; print\\('Type:', type\\(d\\).__name__, '| Sample keys:', k\\)\")",
+      "Bash(python3 -c ':*)",
+      "Bash(python3 -c \"import ast; ast.parse\\(open\\('main.py','r',encoding='utf-8'\\).read\\(\\)\\); print\\('Syntax OK'\\)\")",
+      "Bash(node --check d:/pollux-main/web_ui/static/script.js)",
+      "Bash(node -e \"require\\('fs'\\).readFileSync\\('d:/pollux-main/web_ui/static/script.js','utf8'\\)\")",
+      "Bash(echo \"exit: $?\")",
+      "Read(//c/Users/ali23/.claude/projects/d--pollux-main/memory/**)",
+      "Bash(python3 -c \"open\\('d:/pollux-main/web_ui/requirements.txt'\\).read\\(\\)\")"
+    ]
+  }
+}
