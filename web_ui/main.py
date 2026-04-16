@@ -154,10 +154,12 @@ async def rate_limit_handler(request: Request, exc: RateLimitExceeded):
 BASE_DIR = Path(__file__).parent
 OUTPUTS_DIR = BASE_DIR / "outputs"
 MODELS_DIR = BASE_DIR / "models"
+VOICE_SAMPLES_DIR = BASE_DIR / "voice_samples"
 DB_PATH = BASE_DIR / "pollux.db"
 
 OUTPUTS_DIR.mkdir(exist_ok=True)
 MODELS_DIR.mkdir(exist_ok=True)
+VOICE_SAMPLES_DIR.mkdir(exist_ok=True)
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -1827,6 +1829,288 @@ def list_song_voices(user=Depends(get_current_user)):
     }
 
 
+# ---------------------------------------------------------------------------
+# Voice Cloning  (Coqui XTTS v2 — clone any voice from a 3-30 sec sample)
+# ---------------------------------------------------------------------------
+
+_xtts_model = None   # lazy-loaded
+_xtts_lock = __import__("threading").Lock()
+
+CLONE_ALLOWED_EXT   = {".wav", ".mp3", ".ogg", ".flac", ".m4a"}
+CLONE_MAX_FILE_SIZE = 10 * 1024 * 1024   # 10 MB
+CLONE_MIN_DURATION  = 3.0                # seconds
+CLONE_MAX_DURATION  = 30.0               # seconds
+CLONE_MAX_PER_USER  = 10                 # max saved voice profiles
+
+XTTS_LANGUAGES = {
+    "en", "es", "fr", "de", "it", "pt", "pl",
+    "tr", "ru", "nl", "cs", "ar", "zh-cn",
+    "hu", "ko", "ja", "hi",
+}
+
+
+def _load_xtts():
+    global _xtts_model
+    with _xtts_lock:
+        if _xtts_model is not None:
+            return _xtts_model
+        try:
+            from TTS.api import TTS as CoquiTTS
+            import torch
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            _xtts_model = CoquiTTS(
+                "tts_models/multilingual/multi-dataset/xtts_v2"
+            ).to(device)
+            logger.info(f"XTTS v2 loaded on {device}")
+            return _xtts_model
+        except ImportError as e:
+            raise HTTPException(status_code=500, detail=f"Coqui TTS not installed: {e}")
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Failed to load XTTS v2: {e}")
+
+
+def _check_audio_duration(file_bytes: bytes, ext: str) -> float:
+    """Return duration in seconds; raises HTTPException if invalid."""
+    try:
+        import soundfile as sf
+        import io
+        with sf.SoundFile(io.BytesIO(file_bytes)) as f:
+            duration = len(f) / f.samplerate
+        return duration
+    except Exception:
+        # Fallback: try librosa
+        try:
+            import librosa
+            import io
+            y, sr = librosa.load(io.BytesIO(file_bytes), sr=None)
+            return len(y) / sr
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Cannot read audio file: {e}")
+
+
+# ── Upload a voice sample ────────────────────────────────────────────────────
+
+@app.post("/api/voice_clone/upload", summary="Upload a voice sample to create a cloned voice profile")
+async def upload_voice_sample(
+    file: UploadFile = File(..., description="Voice sample audio (3–30 sec)"),
+    name: str = Form(..., description="Display name for this voice profile"),
+    user=Depends(get_current_user),
+):
+    # Validate name
+    name = name.strip()
+    if not name or len(name) > 60:
+        raise HTTPException(status_code=400, detail="Name must be 1–60 characters.")
+
+    # Validate file extension
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="No file provided.")
+    ext = Path(file.filename).suffix.lower()
+    if ext not in CLONE_ALLOWED_EXT:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported format '{ext}'. Allowed: {CLONE_ALLOWED_EXT}",
+        )
+
+    # Read & size-check
+    content = await file.read()
+    if len(content) > CLONE_MAX_FILE_SIZE:
+        raise HTTPException(status_code=400, detail="File exceeds 10 MB limit.")
+
+    # Duration check
+    duration = _check_audio_duration(content, ext)
+    if duration < CLONE_MIN_DURATION:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Sample too short ({duration:.1f}s). Minimum is {CLONE_MIN_DURATION}s.",
+        )
+    if duration > CLONE_MAX_DURATION:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Sample too long ({duration:.1f}s). Maximum is {CLONE_MAX_DURATION}s.",
+        )
+
+    # Check user's profile count
+    conn = get_db()
+    count = conn.execute(
+        "SELECT COUNT(*) as cnt FROM cloned_voices WHERE user_id = ?", (user["id"],)
+    ).fetchone()["cnt"]
+    if count >= CLONE_MAX_PER_USER:
+        conn.close()
+        raise HTTPException(
+            status_code=400,
+            detail=f"Maximum {CLONE_MAX_PER_USER} voice profiles reached. Delete one first.",
+        )
+
+    # Save sample file
+    sample_filename = f"sample_{user['id']}_{int(time.time())}_{secrets.token_hex(4)}{ext}"
+    sample_path = VOICE_SAMPLES_DIR / sample_filename
+    sample_path.write_bytes(content)
+
+    # Register in DB
+    now = datetime.utcnow().isoformat()
+    cursor = conn.execute(
+        "INSERT INTO cloned_voices (user_id, name, reference_filename, created_at) VALUES (?,?,?,?)",
+        (user["id"], name, sample_filename, now),
+    )
+    voice_id = cursor.lastrowid
+    conn.commit()
+    conn.close()
+
+    logger.info(f"Voice sample uploaded for user {user['email']}: {sample_filename} ({duration:.1f}s)")
+
+    return {
+        "success": True,
+        "voice_id": voice_id,
+        "name": name,
+        "duration_seconds": round(duration, 2),
+        "filename": sample_filename,
+        "created_at": now,
+    }
+
+
+# ── List saved voice profiles ────────────────────────────────────────────────
+
+@app.get("/api/voice_clone/list", summary="List all cloned voice profiles for the current user")
+def list_cloned_voices(user=Depends(get_current_user)):
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT * FROM cloned_voices WHERE user_id = ? ORDER BY created_at DESC",
+        (user["id"],),
+    ).fetchall()
+    conn.close()
+    return {
+        "voices": [dict(r) for r in rows],
+        "count": len(rows),
+        "limit": CLONE_MAX_PER_USER,
+    }
+
+
+# ── Delete a voice profile ───────────────────────────────────────────────────
+
+@app.delete("/api/voice_clone/{voice_id}", summary="Delete a cloned voice profile")
+def delete_cloned_voice(voice_id: int, user=Depends(get_current_user)):
+    conn = get_db()
+    row = conn.execute(
+        "SELECT * FROM cloned_voices WHERE id = ? AND user_id = ?",
+        (voice_id, user["id"]),
+    ).fetchone()
+    if not row:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Voice profile not found.")
+
+    # Delete sample file
+    sample_path = VOICE_SAMPLES_DIR / row["reference_filename"]
+    if sample_path.exists():
+        sample_path.unlink()
+
+    conn.execute("DELETE FROM cloned_voices WHERE id = ?", (voice_id,))
+    conn.commit()
+    conn.close()
+
+    logger.info(f"Cloned voice deleted for user {user['email']}: voice_id={voice_id}")
+    return {"success": True, "deleted_id": voice_id}
+
+
+# ── Generate speech with a cloned voice ─────────────────────────────────────
+
+class VoiceCloneGenerateRequest(BaseModel):
+    voice_id: int
+    text: str
+    language: str = "en"
+
+
+@app.post("/api/voice_clone/generate", summary="Generate TTS using a cloned voice (XTTS v2)")
+def generate_with_cloned_voice(
+    request: VoiceCloneGenerateRequest,
+    user=Depends(get_current_user),
+):
+    # Validate text
+    if not request.text or not request.text.strip():
+        raise HTTPException(status_code=400, detail="Text cannot be empty.")
+    if len(request.text) > MAX_TEXT_LENGTH:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Text exceeds {MAX_TEXT_LENGTH} character limit.",
+        )
+
+    # Validate language
+    lang = request.language.strip().lower()
+    if lang not in XTTS_LANGUAGES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported language '{lang}'. Supported: {sorted(XTTS_LANGUAGES)}",
+        )
+
+    # Credits check
+    if not user["is_premium"] and user["credits"] < CREDITS_PER_GENERATION:
+        return freemium_error(user)
+
+    # Load voice profile
+    conn = get_db()
+    row = conn.execute(
+        "SELECT * FROM cloned_voices WHERE id = ? AND user_id = ?",
+        (request.voice_id, user["id"]),
+    ).fetchone()
+    conn.close()
+    if not row:
+        raise HTTPException(status_code=404, detail="Voice profile not found.")
+
+    sample_path = VOICE_SAMPLES_DIR / row["reference_filename"]
+    if not sample_path.exists():
+        raise HTTPException(status_code=404, detail="Voice sample file missing.")
+
+    # Load XTTS model (lazy)
+    tts = _load_xtts()
+
+    # Generate
+    filename = f"clone_{int(time.time())}_{secrets.token_hex(4)}.wav"
+    out_path = OUTPUTS_DIR / filename
+
+    try:
+        tts.tts_to_file(
+            text=request.text.strip(),
+            speaker_wav=str(sample_path),
+            language=lang,
+            file_path=str(out_path),
+        )
+    except Exception as e:
+        logger.error(f"XTTS generation error: {e}")
+        raise HTTPException(status_code=500, detail=f"Voice cloning generation failed: {e}")
+
+    # Deduct credits + record
+    now = datetime.utcnow().isoformat()
+    conn = get_db()
+    if not user["is_premium"]:
+        conn.execute(
+            "UPDATE users SET credits = credits - ? WHERE id = ?",
+            (CREDITS_PER_GENERATION, user["id"]),
+        )
+    conn.execute(
+        "UPDATE users SET generation_count = generation_count + 1 WHERE id = ?",
+        (user["id"],),
+    )
+    conn.execute(
+        "INSERT INTO generations (user_id, filename, model, text_snippet, created_at) VALUES (?,?,?,?,?)",
+        (user["id"], filename, f"xtts-v2-clone:{row['name']}", request.text[:100], now),
+    )
+    conn.commit()
+    updated = conn.execute("SELECT * FROM users WHERE id = ?", (user["id"],)).fetchone()
+    conn.close()
+
+    logger.info(f"Cloned voice TTS for user {user['email']}: voice='{row['name']}', file={filename}")
+
+    return {
+        "success": True,
+        "filename": filename,
+        "audio_url": f"/api/audio/{filename}",
+        "download_url": f"/api/audio/{filename}/download",
+        "voice_name": row["name"],
+        "language": lang,
+        "credits": updated["credits"] if not updated["is_premium"] else "Unlimited",
+        "generations_remaining": user_remaining(updated),
+    }
+
+
 def _download_to_outputs(audio_url: str, filename: str) -> Path:
     out_path = OUTPUTS_DIR / filename
     try:
@@ -1922,6 +2206,366 @@ def generate_music_fal(request: FalMusicRequest, user=Depends(get_current_user))
         "credits": updated_user["credits"] if not updated_user["is_premium"] else "Unlimited",
         "generations_remaining": user_remaining(updated_user),
     }
+
+
+# ---------------------------------------------------------------------------
+# Voice Cloning  (Coqui XTTS-v2 — fully local, no external API)
+# ---------------------------------------------------------------------------
+
+CLONED_VOICES_DIR = BASE_DIR / "cloned_voices"
+CLONED_VOICES_DIR.mkdir(exist_ok=True)
+
+MAX_REFERENCE_AUDIO_SIZE = 25 * 1024 * 1024   # 25 MB
+MAX_VOICE_PROFILE_NAME_LENGTH = 50
+MAX_VOICE_PROFILES_FREE = 3
+MAX_VOICE_PROFILES_PREMIUM = 20
+VOICE_CLONE_ALLOWED_EXT = {".mp3", ".wav", ".ogg", ".m4a", ".flac"}
+
+# XTTS-v2 supports these BCP-47 language codes
+XTTS_SUPPORTED_LANGUAGES = {
+    "en", "es", "fr", "de", "it", "pt", "pl", "tr",
+    "ru", "nl", "cs", "ar", "zh-cn", "hu", "ko", "ja", "hi",
+}
+
+_xtts_model = None
+
+
+def _load_xtts():
+    """Lazy-load Coqui XTTS-v2. Raises HTTPException if unavailable."""
+    global _xtts_model
+    if _xtts_model is not None:
+        return _xtts_model
+    try:
+        from TTS.api import TTS as CoquiTTS  # pip install TTS
+        _xtts_model = CoquiTTS("tts_models/multilingual/multi-dataset/xtts_v2")
+        logger.info("XTTS-v2 model loaded")
+        return _xtts_model
+    except ImportError:
+        raise HTTPException(
+            status_code=500,
+            detail="Voice cloning requires the 'TTS' package. Install with: pip install TTS",
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to load XTTS-v2: {e}")
+
+
+# ── one-shot clone (upload reference audio + text → synthesised speech) ──
+
+@app.post("/api/voice_clone/generate", summary="Clone a voice from an uploaded reference clip and synthesise speech")
+async def voice_clone_generate(
+    text: str = Form(..., description="Text to synthesise"),
+    language: str = Form(default="en", description="BCP-47 language code"),
+    reference_audio: UploadFile = File(..., description="Reference audio (6–30 s recommended)"),
+    user=Depends(get_current_user),
+):
+    # Credits check
+    if not user["is_premium"] and user["credits"] < CREDITS_PER_GENERATION:
+        return freemium_error(user)
+
+    # Validate text
+    if not text or not text.strip():
+        raise HTTPException(status_code=400, detail="Text cannot be empty.")
+    if len(text) > MAX_TEXT_LENGTH:
+        raise HTTPException(status_code=400, detail=f"Text exceeds {MAX_TEXT_LENGTH} characters.")
+
+    # Validate language
+    language = language.strip().lower()
+    if language not in XTTS_SUPPORTED_LANGUAGES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported language '{language}'. Supported: {sorted(XTTS_SUPPORTED_LANGUAGES)}",
+        )
+
+    # Validate reference audio
+    if not reference_audio.filename:
+        raise HTTPException(status_code=400, detail="No reference audio provided.")
+    ext = Path(reference_audio.filename).suffix.lower()
+    if ext not in VOICE_CLONE_ALLOWED_EXT:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported format '{ext}'. Allowed: {VOICE_CLONE_ALLOWED_EXT}",
+        )
+    content = await reference_audio.read()
+    if len(content) > MAX_REFERENCE_AUDIO_SIZE:
+        raise HTTPException(status_code=400, detail="Reference audio exceeds 25 MB limit.")
+
+    # Write reference to a temp file (XTTS needs a file path)
+    tmp_ref_path = None
+    out_filename = f"clone_{int(time.time())}_{secrets.token_hex(4)}.wav"
+    out_path = OUTPUTS_DIR / out_filename
+    try:
+        with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp:
+            tmp.write(content)
+            tmp_ref_path = tmp.name
+
+        tts = _load_xtts()
+        tts.tts_to_file(
+            text=text.strip(),
+            speaker_wav=tmp_ref_path,
+            language=language,
+            file_path=str(out_path),
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Voice clone generate error for {user['email']}: {e}")
+        raise HTTPException(status_code=500, detail=f"Voice cloning failed: {e}")
+    finally:
+        if tmp_ref_path:
+            try:
+                Path(tmp_ref_path).unlink()
+            except Exception:
+                pass
+
+    # Record usage
+    now = datetime.utcnow().isoformat()
+    conn = get_db()
+    if not user["is_premium"]:
+        conn.execute(
+            "UPDATE users SET credits = credits - ? WHERE id = ?",
+            (CREDITS_PER_GENERATION, user["id"]),
+        )
+    conn.execute(
+        "UPDATE users SET generation_count = generation_count + 1 WHERE id = ?",
+        (user["id"],),
+    )
+    conn.execute(
+        "INSERT INTO generations (user_id, filename, model, text_snippet, created_at) VALUES (?,?,?,?,?)",
+        (user["id"], out_filename, "__voice_clone__", text[:100], now),
+    )
+    conn.commit()
+    updated = conn.execute("SELECT * FROM users WHERE id = ?", (user["id"],)).fetchone()
+    conn.close()
+
+    logger.info(f"Voice clone generated for {user['email']}: {out_filename}")
+
+    return {
+        "success": True,
+        "filename": out_filename,
+        "audio_url": f"/api/audio/{out_filename}",
+        "download_url": f"/api/audio/{out_filename}/download",
+        "credits": updated["credits"] if not updated["is_premium"] else "Unlimited",
+        "generations_remaining": user_remaining(updated),
+    }
+
+
+# ── save a reusable voice profile ──
+
+@app.post("/api/voice_clone/save_profile", summary="Save a voice profile from reference audio for repeated use")
+async def save_voice_profile(
+    name: str = Form(..., description="Display name for this voice profile"),
+    reference_audio: UploadFile = File(..., description="Reference audio file"),
+    user=Depends(get_current_user),
+):
+    max_profiles = MAX_VOICE_PROFILES_PREMIUM if user["is_premium"] else MAX_VOICE_PROFILES_FREE
+    conn = get_db()
+    existing_count = conn.execute(
+        "SELECT COUNT(*) as cnt FROM cloned_voices WHERE user_id = ?", (user["id"],)
+    ).fetchone()["cnt"]
+    conn.close()
+
+    if existing_count >= max_profiles:
+        detail = (
+            f"Voice profile limit reached ({max_profiles}). "
+            + ("Delete an existing profile to add a new one." if user["is_premium"]
+               else "Upgrade to premium for more profiles.")
+        )
+        raise HTTPException(status_code=403, detail=detail)
+
+    # Validate name
+    name = name.strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Profile name cannot be empty.")
+    if len(name) > MAX_VOICE_PROFILE_NAME_LENGTH:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Profile name exceeds {MAX_VOICE_PROFILE_NAME_LENGTH} characters.",
+        )
+
+    # Validate reference audio
+    if not reference_audio.filename:
+        raise HTTPException(status_code=400, detail="No reference audio provided.")
+    ext = Path(reference_audio.filename).suffix.lower()
+    if ext not in VOICE_CLONE_ALLOWED_EXT:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported format '{ext}'. Allowed: {VOICE_CLONE_ALLOWED_EXT}",
+        )
+    content = await reference_audio.read()
+    if len(content) > MAX_REFERENCE_AUDIO_SIZE:
+        raise HTTPException(status_code=400, detail="Reference audio exceeds 25 MB limit.")
+
+    # Persist reference audio
+    ref_filename = f"ref_{user['id']}_{int(time.time())}_{secrets.token_hex(4)}{ext}"
+    ref_path = CLONED_VOICES_DIR / ref_filename
+    ref_path.write_bytes(content)
+
+    now = datetime.utcnow().isoformat()
+    conn = get_db()
+    cursor = conn.execute(
+        "INSERT INTO cloned_voices (user_id, name, reference_filename, created_at) VALUES (?,?,?,?)",
+        (user["id"], name, ref_filename, now),
+    )
+    profile_id = cursor.lastrowid
+    conn.commit()
+    conn.close()
+
+    logger.info(f"Voice profile saved for {user['email']}: '{name}' (id={profile_id})")
+
+    return {
+        "success": True,
+        "profile_id": profile_id,
+        "name": name,
+        "created_at": now,
+    }
+
+
+# ── list saved profiles ──
+
+@app.get("/api/voice_clone/profiles", summary="List saved voice profiles for the current user")
+def list_voice_profiles(user=Depends(get_current_user)):
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT id, name, reference_filename, created_at FROM cloned_voices "
+        "WHERE user_id = ? ORDER BY created_at DESC",
+        (user["id"],),
+    ).fetchall()
+    conn.close()
+    max_profiles = MAX_VOICE_PROFILES_PREMIUM if user["is_premium"] else MAX_VOICE_PROFILES_FREE
+    return {
+        "profiles": [dict(r) for r in rows],
+        "count": len(rows),
+        "max_profiles": max_profiles,
+    }
+
+
+# ── delete a saved profile ──
+
+@app.delete("/api/voice_clone/profiles/{profile_id}", summary="Delete a saved voice profile")
+def delete_voice_profile(profile_id: int, user=Depends(get_current_user)):
+    conn = get_db()
+    row = conn.execute(
+        "SELECT * FROM cloned_voices WHERE id = ? AND user_id = ?",
+        (profile_id, user["id"]),
+    ).fetchone()
+    if not row:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Voice profile not found.")
+
+    # Remove stored reference audio
+    ref_path = CLONED_VOICES_DIR / row["reference_filename"]
+    if ref_path.exists():
+        ref_path.unlink()
+
+    conn.execute("DELETE FROM cloned_voices WHERE id = ?", (profile_id,))
+    conn.commit()
+    conn.close()
+
+    logger.info(f"Voice profile {profile_id} deleted for {user['email']}")
+
+    return {"success": True, "deleted_id": profile_id}
+
+
+# ── generate from a saved profile ──
+
+class VoiceCloneFromProfileRequest(BaseModel):
+    text: str
+    language: str = "en"
+
+
+@app.post("/api/voice_clone/from_profile/{profile_id}", summary="Synthesise speech using a saved voice profile")
+def voice_clone_from_profile(
+    profile_id: int,
+    request: VoiceCloneFromProfileRequest,
+    user=Depends(get_current_user),
+):
+    # Credits check
+    if not user["is_premium"] and user["credits"] < CREDITS_PER_GENERATION:
+        return freemium_error(user)
+
+    # Validate text
+    if not request.text or not request.text.strip():
+        raise HTTPException(status_code=400, detail="Text cannot be empty.")
+    if len(request.text) > MAX_TEXT_LENGTH:
+        raise HTTPException(status_code=400, detail=f"Text exceeds {MAX_TEXT_LENGTH} characters.")
+
+    # Validate language
+    language = request.language.strip().lower()
+    if language not in XTTS_SUPPORTED_LANGUAGES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported language '{language}'. Supported: {sorted(XTTS_SUPPORTED_LANGUAGES)}",
+        )
+
+    # Fetch profile
+    conn = get_db()
+    profile = conn.execute(
+        "SELECT * FROM cloned_voices WHERE id = ? AND user_id = ?",
+        (profile_id, user["id"]),
+    ).fetchone()
+    conn.close()
+    if not profile:
+        raise HTTPException(status_code=404, detail="Voice profile not found.")
+
+    ref_path = CLONED_VOICES_DIR / profile["reference_filename"]
+    if not ref_path.exists():
+        raise HTTPException(status_code=404, detail="Reference audio file missing from server.")
+
+    # Synthesise
+    out_filename = f"clone_{int(time.time())}_{secrets.token_hex(4)}.wav"
+    out_path = OUTPUTS_DIR / out_filename
+    try:
+        tts = _load_xtts()
+        tts.tts_to_file(
+            text=request.text.strip(),
+            speaker_wav=str(ref_path),
+            language=language,
+            file_path=str(out_path),
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Voice clone from profile error for {user['email']}: {e}")
+        raise HTTPException(status_code=500, detail=f"Voice cloning failed: {e}")
+
+    # Record usage
+    now = datetime.utcnow().isoformat()
+    conn = get_db()
+    if not user["is_premium"]:
+        conn.execute(
+            "UPDATE users SET credits = credits - ? WHERE id = ?",
+            (CREDITS_PER_GENERATION, user["id"]),
+        )
+    conn.execute(
+        "UPDATE users SET generation_count = generation_count + 1 WHERE id = ?",
+        (user["id"],),
+    )
+    conn.execute(
+        "INSERT INTO generations (user_id, filename, model, text_snippet, created_at) VALUES (?,?,?,?,?)",
+        (user["id"], out_filename, f"__voice_clone_profile_{profile_id}__", request.text[:100], now),
+    )
+    conn.commit()
+    updated = conn.execute("SELECT * FROM users WHERE id = ?", (user["id"],)).fetchone()
+    conn.close()
+
+    logger.info(f"Voice clone from profile {profile_id} for {user['email']}: {out_filename}")
+
+    return {
+        "success": True,
+        "filename": out_filename,
+        "audio_url": f"/api/audio/{out_filename}",
+        "download_url": f"/api/audio/{out_filename}/download",
+        "voice_profile": profile["name"],
+        "credits": updated["credits"] if not updated["is_premium"] else "Unlimited",
+        "generations_remaining": user_remaining(updated),
+    }
+
+
+# ── list supported languages ──
+
+@app.get("/api/voice_clone/languages", summary="List languages supported by the voice cloning engine")
+def voice_clone_languages(user=Depends(get_current_user)):
+    return {"languages": sorted(XTTS_SUPPORTED_LANGUAGES)}
 
 
 # ---------------------------------------------------------------------------

@@ -44,6 +44,26 @@ def init_db():
         )
     """
     )
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS locked_accounts (
+            email TEXT PRIMARY KEY,
+            locked_until TEXT NOT NULL
+        )
+    """
+    )
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS cloned_voices (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            name TEXT NOT NULL,
+            reference_filename TEXT NOT NULL,
+            created_at TEXT,
+            FOREIGN KEY (user_id) REFERENCES users (id)
+        )
+    """
+    )
     conn.commit()
     conn.close()
 
