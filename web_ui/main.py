@@ -2729,10 +2729,3 @@ def mock_payment_webhook(user_id: int):
 # Static file serving (must be mounted after all API routes)
 # ---------------------------------------------------------------------------
 
-@app.get("/", include_in_schema=False)
-def serve_index():
-    return FileResponse(BASE_DIR / "static" / "index.html")
-
-
-app.mount("/static", StaticFiles(directory=str(BASE_DIR / "static")), name="static")
-
