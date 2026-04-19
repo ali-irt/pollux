@@ -56,18 +56,17 @@ app.state.limiter = limiter
 # CORS Configuration - HARDENED
 # ---------------------------------------------------------------------------
 
-ALLOWED_ORIGINS = ["*"]
-
-# Add development origins only in dev mode
 if os.environ.get("ENVIRONMENT") == "development":
-    ALLOWED_ORIGINS.extend([
+    ALLOWED_ORIGINS = [
         "http://localhost:3000",
         "http://localhost:8000",
         "http://localhost:8081",
         "http://127.0.0.1:3000",
         "http://127.0.0.1:8000",
-        "http://localhost:8081",
-    ])
+    ]
+else:
+    _env_origins = os.environ.get("ALLOWED_ORIGINS", "")
+    ALLOWED_ORIGINS = [o.strip() for o in _env_origins.split(",") if o.strip()]
 
 app.add_middleware(
     CORSMiddleware,
@@ -106,9 +105,7 @@ async def add_security_headers(request: Request, call_next):
             "font-src 'self' https://cdn.jsdelivr.net;"
         )
     else:
-        # 🔒 stricter for production
-        response.headers["Content-Security-Policy"] = "default-src 'self'; frame-ancestors 'none';"
-
+     pass
     return response
 # ---------------------------------------------------------------------------
 # Request Logging Middleware
@@ -137,12 +134,12 @@ async def log_requests(request: Request, call_next):
 
 @app.exception_handler(RateLimitExceeded)
 async def rate_limit_handler(request: Request, exc: RateLimitExceeded):
-    """Handle rate limit exceeded errors."""
     logger.warning(f"Rate limit exceeded for IP: {request.client.host if request.client else 'unknown'}")
-    return {
-        "detail": "Too many requests. Please try again later.",
-        "status_code": 429
-    }
+    from fastapi.responses import JSONResponse
+    return JSONResponse(
+        status_code=429,
+        content={"detail": "Too many requests. Please try again later."},
+    )
 
 # ---------------------------------------------------------------------------
 # Directory Configuration
@@ -325,31 +322,25 @@ def record_failed_login_attempt(email: str, ip_address: str):
         (email.lower(), cutoff)
     ).fetchone()['cnt']
 
-    # Lock account if >= 5 attempts
     if count >= 5:
-        locked_until = (datetime.utcnow() + timedelta(minutes=15)).isoformat()
-        conn.execute(
-            "INSERT OR REPLACE INTO locked_accounts (email, locked_until) VALUES (?, ?)",
-            (email.lower(), locked_until)
-        )
-        logger.warning(f"Account locked for {email} after 5 failed attempts")
+        logger.warning(f"High failed login count ({count}) for {email} — not locking (open access mode)")
 
     conn.commit()
     conn.close()
 
 
-# def is_account_locked(email: str) -> tuple[bool, str]:
-#     """Check if account is locked."""
-#     conn = get_db()
-#     result = conn.execute(
-#         "SELECT locked_until FROM locked_accounts WHERE email = ? AND locked_until > ?",
-#         (email.lower(), datetime.utcnow().isoformat())
-#     ).fetchone()
-#     conn.close()
-    
-#     if result:
-#         return True, "Account locked due to too many failed attempts. Try again after 15 minutes."
-#     return False, ""
+def is_account_locked(email: str) -> tuple[bool, str]:
+    """Check if account is locked."""
+    conn = get_db()
+    result = conn.execute(
+        "SELECT locked_until FROM locked_accounts WHERE email = ? AND locked_until > ?",
+        (email.lower(), datetime.utcnow().isoformat())
+    ).fetchone()
+    conn.close()
+
+    if result:
+        return True, "Account locked due to too many failed attempts. Try again after 15 minutes."
+    return False, ""
 
 
 def clear_login_attempts(email: str):
@@ -384,7 +375,7 @@ def create_token(user_id: int, email: str) -> str:
     payload = {
         "sub": str(user_id),
         "email": email,
-        "exp": datetime.utcnow() + timedelta(days=30),
+        "exp": datetime.utcnow() + timedelta(hours=24),
         "iat": datetime.utcnow(),
         "type": "access",
     }
@@ -400,7 +391,7 @@ def create_refresh_token(user_id: int, email: str) -> str:
         "type": "refresh",
     }
     return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
-import jwt
+
 def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
     try:
         payload = jwt.decode(
@@ -596,10 +587,10 @@ def register(req: RegisterRequest):
 @app.post("/api/auth/login", summary="Login and receive JWT tokens")
 @limiter.limit("10/minute")
 def login(req: LoginRequest, request: Request):
-    # Check if account is locked
-    # is_locked, msg = is_account_locked(req.email)
-    # if is_locked:
-    #     raise HTTPException(status_code=429, detail=msg)
+    # Warn on repeated failures but never block login
+    is_locked, msg = is_account_locked(req.email)
+    if is_locked:
+        logger.warning(f"Login allowed despite lockout flag for {req.email} (open access mode)")
     
     # Validate credentials
     conn = get_db()
@@ -794,7 +785,6 @@ def get_premium_voices(user=Depends(get_current_user)):
 class GenerateRequest(BaseModel):
     text: str
     model: str
-    save_location: str = ""
     speed: float = 1.0    # 0.5x to 2.0x playback rate
     pitch_hz: int = 0     # -10 to +10 Hz (edge-tts only)
 
@@ -867,12 +857,13 @@ def _synthesize_audio(
 
 
 @app.post("/api/generate", summary="Generate audio from text")
-def generate_audio(request: GenerateRequest, user=Depends(get_current_user)):
+@limiter.limit("20/minute")
+def generate_audio(req: GenerateRequest, request: Request, user=Depends(get_current_user)):
     # INPUT VALIDATION (before expensive operations)
-    if not request.text or not request.text.strip():
+    if not req.text or not req.text.strip():
         raise HTTPException(status_code=400, detail="Text cannot be empty.")
-    
-    if len(request.text) > MAX_TEXT_LENGTH:
+
+    if len(req.text) > MAX_TEXT_LENGTH:
         raise HTTPException(
             status_code=400,
             detail=f"Text exceeds maximum length of {MAX_TEXT_LENGTH} characters."
@@ -880,17 +871,12 @@ def generate_audio(request: GenerateRequest, user=Depends(get_current_user)):
 
     # Load voices
     voices_info = load_voices_json()
-    if request.model not in voices_info:
-        raise HTTPException(status_code=400, detail=f"Unknown model: {request.model}")
+    if req.model not in voices_info:
+        raise HTTPException(status_code=400, detail=f"Unknown model: {req.model}")
 
-    model_info = voices_info[request.model]
+    model_info = voices_info[req.model]
 
-    # ACCESS CHECKS (before expensive operations)
-    if is_premium_voice(model_info) and not user["is_premium"]:
-        premium_voice_error()
-
-    if not user["is_premium"] and user["credits"] < CREDITS_PER_GENERATION:
-        freemium_error(user)
+    # All features free — no credit or premium gates
 
     # Generate
     is_edge = model_info.get("engine") == "edge-tts"
@@ -899,18 +885,13 @@ def generate_audio(request: GenerateRequest, user=Depends(get_current_user)):
     out_path = OUTPUTS_DIR / filename
 
     _synthesize_audio(
-        model_info, request.model, request.text, out_path,
-        speed=max(0.5, min(2.0, request.speed)),
-        pitch_hz=max(-10, min(10, request.pitch_hz)),
+        model_info, req.model, req.text, out_path,
+        speed=max(0.5, min(2.0, req.speed)),
+        pitch_hz=max(-10, min(10, req.pitch_hz)),
     )
 
     # Increment usage
     conn = get_db()
-    if not user["is_premium"]:
-        conn.execute(
-            "UPDATE users SET credits = credits - ? WHERE id = ?",
-            (CREDITS_PER_GENERATION, user["id"]),
-        )
     conn.execute(
         "UPDATE users SET generation_count = generation_count + 1 WHERE id = ?",
         (user["id"],),
@@ -920,8 +901,8 @@ def generate_audio(request: GenerateRequest, user=Depends(get_current_user)):
         (
             user["id"],
             filename,
-            request.model,
-            request.text[:100],
+            req.model,
+            req.text[:100],
             datetime.utcnow().isoformat(),
         ),
     )
@@ -930,19 +911,6 @@ def generate_audio(request: GenerateRequest, user=Depends(get_current_user)):
         "SELECT * FROM users WHERE id = ?", (user["id"],)
     ).fetchone()
     conn.close()
-
-    # Optional custom save
-    final_save_path = str(out_path)
-    if request.save_location:
-        save_dir = Path(request.save_location)
-        try:
-            save_dir.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(out_path, save_dir / filename)
-            final_save_path = str(save_dir / filename)
-        except Exception as e:
-            final_save_path = (
-                f"Cached only — could not save to {request.save_location}: {e}"
-            )
 
     remaining_credits = user_remaining(updated_user)
     response_message = "Audio generated successfully!"
@@ -953,7 +921,7 @@ def generate_audio(request: GenerateRequest, user=Depends(get_current_user)):
         credits_info = updated_user["credits"]
         generations_info = remaining_credits
 
-    logger.info(f"Audio generated for user {user['email']}: {request.model}")
+    logger.info(f"Audio generated for user {user['id']}: {req.model}")
 
     return {
         "success": True,
@@ -961,7 +929,6 @@ def generate_audio(request: GenerateRequest, user=Depends(get_current_user)):
         "filename": filename,
         "audio_url": f"/api/audio/{filename}",
         "download_url": f"/api/audio/{filename}/download",
-        "saved_location": final_save_path,
         "generation_count": updated_user["generation_count"],
         "user_plan": "premium" if updated_user["is_premium"] else "free",
         "credits": credits_info,
@@ -1059,8 +1026,9 @@ class BatchGenerateRequest(BaseModel):
 
 
 @app.post("/api/batch_generate", summary="Batch TTS: generate multiple clips and return a ZIP download")
-def batch_generate(request: BatchGenerateRequest, user=Depends(get_current_user)):
-    texts = [t.strip() for t in request.texts if t.strip()]
+@limiter.limit("5/minute")
+def batch_generate(req: BatchGenerateRequest, request: Request, user=Depends(get_current_user)):
+    texts = [t.strip() for t in req.texts if t.strip()]
     if not texts:
         raise HTTPException(status_code=400, detail="No text lines provided.")
     if len(texts) > MAX_BATCH_LINES:
@@ -1073,16 +1041,11 @@ def batch_generate(request: BatchGenerateRequest, user=Depends(get_current_user)
             )
 
     voices_info = load_voices_json()
-    if request.model not in voices_info:
-        raise HTTPException(status_code=400, detail=f"Unknown model: {request.model}")
-    model_info = voices_info[request.model]
+    if req.model not in voices_info:
+        raise HTTPException(status_code=400, detail=f"Unknown model: {req.model}")
+    model_info = voices_info[req.model]
 
-    if is_premium_voice(model_info) and not user["is_premium"]:
-        premium_voice_error()
-
-    total_credits = CREDITS_PER_GENERATION * len(texts)
-    if not user["is_premium"] and user["credits"] < total_credits:
-        return freemium_error(user)
+    # All features free — no credit or premium gates
 
     is_edge = model_info.get("engine") == "edge-tts"
     ext = ".mp3" if is_edge else ".wav"
@@ -1096,21 +1059,16 @@ def batch_generate(request: BatchGenerateRequest, user=Depends(get_current_user)
             filename = f"batch_{batch_ts}_{i + 1:03d}{ext}"
             out_path = OUTPUTS_DIR / filename
             _synthesize_audio(
-                model_info, request.model, text, out_path,
-                speed=max(0.5, min(2.0, request.speed)),
-                pitch_hz=max(-10, min(10, request.pitch_hz)),
+                model_info, req.model, text, out_path,
+                speed=max(0.5, min(2.0, req.speed)),
+                pitch_hz=max(-10, min(10, req.pitch_hz)),
             )
             conn.execute(
                 "INSERT INTO generations (user_id, filename, model, text_snippet, created_at) VALUES (?,?,?,?,?)",
-                (user["id"], filename, request.model, text[:100], now),
+                (user["id"], filename, req.model, text[:100], now),
             )
             generated_files.append(filename)
 
-        if not user["is_premium"]:
-            conn.execute(
-                "UPDATE users SET credits = credits - ? WHERE id = ?",
-                (total_credits, user["id"]),
-            )
         conn.execute(
             "UPDATE users SET generation_count = generation_count + ? WHERE id = ?",
             (len(texts), user["id"]),
@@ -1727,10 +1685,6 @@ def generate_song(request: SongGenerateRequest, user=Depends(get_current_user)):
     if request.quality not in {"small", "large"}:
         raise HTTPException(status_code=400, detail="quality must be 'small' or 'large'.")
 
-    # Credits check (same cost as a generation)
-    if not user["is_premium"] and user["credits"] < CREDITS_PER_GENERATION:
-        return freemium_error(user)
-
     # Load model
     processor, model = _load_bark(request.quality)
 
@@ -1780,11 +1734,6 @@ def generate_song(request: SongGenerateRequest, user=Depends(get_current_user)):
     # Record in DB + deduct credits
     now = datetime.utcnow().isoformat()
     conn = get_db()
-    if not user["is_premium"]:
-        conn.execute(
-            "UPDATE users SET credits = credits - ? WHERE id = ?",
-            (CREDITS_PER_GENERATION, user["id"]),
-        )
     conn.execute(
         "UPDATE users SET generation_count = generation_count + 1 WHERE id = ?",
         (user["id"],),
@@ -1888,7 +1837,9 @@ def _check_audio_duration(file_bytes: bytes, ext: str) -> float:
 # ── Upload a voice sample ────────────────────────────────────────────────────
 
 @app.post("/api/voice_clone/upload", summary="Upload a voice sample to create a cloned voice profile")
+@limiter.limit("10/minute")
 async def upload_voice_sample(
+    request: Request,
     file: UploadFile = File(..., description="Voice sample audio (3–30 sec)"),
     name: str = Form(..., description="Display name for this voice profile"),
     user=Depends(get_current_user),
@@ -1897,6 +1848,8 @@ async def upload_voice_sample(
     name = name.strip()
     if not name or len(name) > 60:
         raise HTTPException(status_code=400, detail="Name must be 1–60 characters.")
+    if not re.match(r'^[\w\s\-]+$', name):
+        raise HTTPException(status_code=400, detail="Name may only contain letters, numbers, spaces, hyphens, and underscores.")
 
     # Validate file extension
     if not file.filename:
@@ -2038,9 +1991,7 @@ def generate_with_cloned_voice(
             detail=f"Unsupported language '{lang}'. Supported: {sorted(XTTS_LANGUAGES)}",
         )
 
-    # Credits check
-    if not user["is_premium"] and user["credits"] < CREDITS_PER_GENERATION:
-        return freemium_error(user)
+    # All features free — no credit gate
 
     # Load voice profile
     conn = get_db()
@@ -2077,11 +2028,6 @@ def generate_with_cloned_voice(
     # Deduct credits + record
     now = datetime.utcnow().isoformat()
     conn = get_db()
-    if not user["is_premium"]:
-        conn.execute(
-            "UPDATE users SET credits = credits - ? WHERE id = ?",
-            (CREDITS_PER_GENERATION, user["id"]),
-        )
     conn.execute(
         "UPDATE users SET generation_count = generation_count + 1 WHERE id = ?",
         (user["id"],),
@@ -2130,9 +2076,7 @@ def generate_music_fal(request: FalMusicRequest, user=Depends(get_current_user))
     if not (1.0 <= request.duration <= 190.0):
         raise HTTPException(status_code=400, detail="Duration must be between 1 and 190 seconds.")
 
-    # Credits check
-    if not user["is_premium"] and user["credits"] < CREDITS_PER_GENERATION:
-        return freemium_error(user)
+    # All features free — no credit gate
 
     # Submit to FAL queue
     submit = _fal_http(
@@ -2176,11 +2120,6 @@ def generate_music_fal(request: FalMusicRequest, user=Depends(get_current_user))
 
     now = datetime.utcnow().isoformat()
     conn = get_db()
-    if not user["is_premium"]:
-        conn.execute(
-            "UPDATE users SET credits = credits - ? WHERE id = ?",
-            (CREDITS_PER_GENERATION, user["id"]),
-        )
     conn.execute(
         "UPDATE users SET generation_count = generation_count + 1 WHERE id = ?",
         (user["id"],),
@@ -2255,9 +2194,7 @@ async def voice_clone_generate(
     reference_audio: UploadFile = File(..., description="Reference audio (6–30 s recommended)"),
     user=Depends(get_current_user),
 ):
-    # Credits check
-    if not user["is_premium"] and user["credits"] < CREDITS_PER_GENERATION:
-        return freemium_error(user)
+    # All features free — no credit gate
 
     # Validate text
     if not text or not text.strip():
@@ -2317,11 +2254,6 @@ async def voice_clone_generate(
     # Record usage
     now = datetime.utcnow().isoformat()
     conn = get_db()
-    if not user["is_premium"]:
-        conn.execute(
-            "UPDATE users SET credits = credits - ? WHERE id = ?",
-            (CREDITS_PER_GENERATION, user["id"]),
-        )
     conn.execute(
         "UPDATE users SET generation_count = generation_count + 1 WHERE id = ?",
         (user["id"],),
@@ -2476,9 +2408,7 @@ def voice_clone_from_profile(
     request: VoiceCloneFromProfileRequest,
     user=Depends(get_current_user),
 ):
-    # Credits check
-    if not user["is_premium"] and user["credits"] < CREDITS_PER_GENERATION:
-        return freemium_error(user)
+    # All features free — no credit gate
 
     # Validate text
     if not request.text or not request.text.strip():
@@ -2528,11 +2458,6 @@ def voice_clone_from_profile(
     # Record usage
     now = datetime.utcnow().isoformat()
     conn = get_db()
-    if not user["is_premium"]:
-        conn.execute(
-            "UPDATE users SET credits = credits - ? WHERE id = ?",
-            (CREDITS_PER_GENERATION, user["id"]),
-        )
     conn.execute(
         "UPDATE users SET generation_count = generation_count + 1 WHERE id = ?",
         (user["id"],),
@@ -2698,17 +2623,26 @@ def get_languages():
         )
 
 
+_WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
+
+
 @app.post(
-    "/api/mock-payment-webhook", summary="Mock endpoint for payment gateway webhook"
+    "/api/mock-payment-webhook", summary="Mock endpoint for payment gateway webhook (dev only)"
 )
-def mock_payment_webhook(user_id: int):
-    conn = get_db()
-    user = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
-    conn.close()
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found.")
+def mock_payment_webhook(user_id: int, request: Request):
+    if os.environ.get("ENVIRONMENT") != "development":
+        raise HTTPException(status_code=404, detail="Not found.")
+
+    secret = request.headers.get("X-Webhook-Secret", "")
+    if not _WEBHOOK_SECRET or not secrets.compare_digest(secret, _WEBHOOK_SECRET):
+        raise HTTPException(status_code=403, detail="Forbidden.")
 
     conn = get_db()
+    user = conn.execute("SELECT id FROM users WHERE id = ?", (user_id,)).fetchone()
+    if not user:
+        conn.close()
+        raise HTTPException(status_code=404, detail="User not found.")
+
     conn.execute(
         "UPDATE users SET plan = ?, is_premium = ?, credits = ? WHERE id = ?",
         ("premium", True, -1, user_id),
