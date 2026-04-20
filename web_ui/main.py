@@ -1,4 +1,5 @@
 import os
+import gc
 import time
 import shutil
 import subprocess
@@ -6,6 +7,7 @@ import hashlib
 import secrets
 import re
 import logging
+import threading
 import zipfile
 from pathlib import Path
 from fastapi import FastAPI, HTTPException, Depends, Query, Request, UploadFile, File, Form
@@ -164,6 +166,7 @@ if not JWT_SECRET or len(JWT_SECRET) < 32:
     raise ValueError("POLLUX_JWT_SECRET must be set and at least 32 characters")
 
 JWT_ALGORITHM = os.environ.get("JWT_ALGORITHM", "HS256")
+BASE_URL = os.environ.get("BASE_URL", "http://localhost:8000")
 INITIAL_FREE_CREDITS = 50
 CREDITS_PER_GENERATION = 5
 PREMIUM_QUALITIES = {"high", "medium"}
@@ -1167,9 +1170,24 @@ def translate_text(request: TranslateRequest, user=Depends(get_current_user)):
 # Music generation (premium only)
 # ---------------------------------------------------------------------------
 
-music_processor = None
-music_model = None
-music_device = "cpu"
+_music_cache_ready = False
+_music_load_lock = threading.Lock()
+
+
+def _prefetch_music_model():
+    global _music_cache_ready
+    try:
+        from huggingface_hub import snapshot_download
+        snapshot_download(repo_id="facebook/musicgen-small")
+        _music_cache_ready = True
+        logger.info("MusicGen model files cached to disk")
+    except Exception as e:
+        logger.warning(f"MusicGen pre-cache failed (will download on first use): {e}")
+
+
+@app.on_event("startup")
+def startup_event():
+    threading.Thread(target=_prefetch_music_model, daemon=True).start()
 
 
 class MusicGenerateRequest(BaseModel):
@@ -1179,73 +1197,71 @@ class MusicGenerateRequest(BaseModel):
 
 @app.post("/api/generate_music", summary="Generate music from a text prompt (premium)")
 def generate_music(request: MusicGenerateRequest, user=Depends(get_current_user)):
-    # if not user["is_premium"]:
-    #     premium_feature_error("Music generation")
-    
     if not request.prompt or not request.prompt.strip():
         raise HTTPException(status_code=400, detail="Prompt cannot be empty.")
-    
+
     if len(request.prompt) > MAX_MUSIC_PROMPT_LENGTH:
         raise HTTPException(
             status_code=400,
             detail=f"Prompt exceeds maximum length of {MAX_MUSIC_PROMPT_LENGTH} characters."
         )
 
-    global music_processor, music_model, music_device
-    if music_processor is None:
+    with _music_load_lock:
         try:
             import torch
+            import scipy.io.wavfile
             from transformers import AutoProcessor, MusicgenForConditionalGeneration
 
             if torch.backends.mps.is_available():
-                music_device = "mps"
+                device = "mps"
+                dtype = torch.float32
             elif torch.cuda.is_available():
-                music_device = "cuda"
+                device = "cuda"
+                dtype = torch.float16
             else:
-                music_device = "cpu"
-            music_processor = AutoProcessor.from_pretrained("facebook/musicgen-small")
-            music_model = MusicgenForConditionalGeneration.from_pretrained(
-                "facebook/musicgen-small"
-            ).to(music_device)
+                device = "cpu"
+                dtype = torch.float32
+
+            processor = AutoProcessor.from_pretrained("facebook/musicgen-small")
+            model = MusicgenForConditionalGeneration.from_pretrained(
+                "facebook/musicgen-small",
+                torch_dtype=dtype,
+                low_cpu_mem_usage=True,
+            ).to(device)
+
+            try:
+                inputs = processor(
+                    text=[request.prompt], padding=True, return_tensors="pt"
+                ).to(device)
+                audio_values = model.generate(
+                    **inputs, max_new_tokens=int(request.duration * 25.6)
+                )
+                sampling_rate = model.config.audio_encoder.sampling_rate
+                audio_np = audio_values[0, 0].cpu().numpy()
+            finally:
+                del model
+                del inputs
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+            filename = f"music_{int(time.time())}.wav"
+            out_path = OUTPUTS_DIR / filename
+            scipy.io.wavfile.write(str(out_path), rate=sampling_rate, data=audio_np)
+
+            logger.info(f"Music generated for user {user['email']}")
+            return {
+                "success": True,
+                "filename": filename,
+                "audio_url": f"/api/audio/{filename}",
+                "download_url": f"/api/audio/{filename}/download",
+                "saved_location": str(out_path),
+            }
         except ImportError as e:
-            raise HTTPException(
-                status_code=500, detail=f"MusicGen dependencies missing: {e}"
-            )
+            raise HTTPException(status_code=500, detail=f"MusicGen dependencies missing: {e}")
         except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Failed to load MusicGen: {e}")
-
-    assert music_model is not None
-    assert music_processor is not None
-
-    try:
-        import scipy.io.wavfile
-
-        inputs = music_processor(
-            text=[request.prompt], padding=True, return_tensors="pt"
-        ).to(music_device)
-        audio_values = music_model.generate(
-            **inputs, max_new_tokens=int(request.duration * 25.6)
-        )
-        filename = f"music_{int(time.time())}.wav"
-        out_path = OUTPUTS_DIR / filename
-        scipy.io.wavfile.write(
-            str(out_path),
-            rate=music_model.config.audio_encoder.sampling_rate,
-            data=audio_values[0, 0].cpu().numpy(),
-        )
-        
-        logger.info(f"Music generated for user {user['email']}")
-        
-        return {
-            "success": True,
-            "filename": filename,
-            "audio_url": f"/api/audio/{filename}",
-            "download_url": f"/api/audio/{filename}/download",
-            "saved_location": str(out_path),
-        }
-    except Exception as e:
-        logger.error(f"Music generation error: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Music generation error: {str(e)}")
+            logger.error(f"Music generation error: {str(e)}")
+            raise HTTPException(status_code=500, detail=f"Music generation error: {str(e)}")
 
 
 # ---------------------------------------------------------------------------
@@ -2657,6 +2673,75 @@ def mock_payment_webhook(user_id: int, request: Request):
         "message": f"User {user_id} upgraded to premium via mock webhook.",
     }
 
+
+
+# ---------------------------------------------------------------------------
+# Mobile / client endpoint discovery
+# ---------------------------------------------------------------------------
+
+@app.get("/api/endpoints", summary="List all API endpoints (mobile dev reference)", tags=["Info"])
+def list_endpoints():
+    """Returns base URL and a structured map of every endpoint — use this to configure your mobile API client."""
+    endpoints = [
+        # ── Auth ──────────────────────────────────────────────────────────────
+        {"group": "Auth", "method": "POST", "path": "/api/auth/register",         "auth": False, "description": "Register a new account"},
+        {"group": "Auth", "method": "POST", "path": "/api/auth/login",            "auth": False, "description": "Login and receive JWT tokens"},
+        {"group": "Auth", "method": "POST", "path": "/api/auth/refresh",          "auth": False, "description": "Refresh access token using refresh_token"},
+        {"group": "Auth", "method": "GET",  "path": "/api/auth/me",               "auth": True,  "description": "Get current user info"},
+        {"group": "Auth", "method": "POST", "path": "/api/auth/change-password",  "auth": True,  "description": "Change account password"},
+        {"group": "Auth", "method": "POST", "path": "/api/auth/upgrade-to-premium","auth": True, "description": "Upgrade user to premium plan"},
+        # ── TTS ───────────────────────────────────────────────────────────────
+        {"group": "TTS",  "method": "POST", "path": "/api/generate",              "auth": True,  "description": "Generate audio from text (rate: 20/min)"},
+        {"group": "TTS",  "method": "POST", "path": "/api/batch_generate",        "auth": True,  "description": "Batch TTS → ZIP download (rate: 5/min)"},
+        # ── Voices ────────────────────────────────────────────────────────────
+        {"group": "Voices","method": "GET", "path": "/api/voices",                "auth": True,  "description": "All voices"},
+        {"group": "Voices","method": "GET", "path": "/api/voices/free",           "auth": True,  "description": "Free-tier voices only"},
+        {"group": "Voices","method": "GET", "path": "/api/voices/premium",        "auth": True,  "description": "Premium voices only"},
+        # ── History ───────────────────────────────────────────────────────────
+        {"group": "History","method": "GET",    "path": "/api/history",           "auth": True,  "description": "Paginated generation history (?page=1&per_page=20)"},
+        {"group": "History","method": "DELETE", "path": "/api/history/{entry_id}","auth": True,  "description": "Delete a single history entry"},
+        {"group": "History","method": "DELETE", "path": "/api/history",           "auth": True,  "description": "Clear all history"},
+        # ── Audio files ───────────────────────────────────────────────────────
+        {"group": "Audio", "method": "GET",    "path": "/api/audio/{filename}",           "auth": True, "description": "Stream audio file"},
+        {"group": "Audio", "method": "GET",    "path": "/api/audio/{filename}/download",  "auth": True, "description": "Download audio file"},
+        {"group": "Audio", "method": "DELETE", "path": "/api/audio/{filename}",           "auth": True, "description": "Delete audio file"},
+        # ── Voice Cloning ─────────────────────────────────────────────────────
+        {"group": "VoiceClone", "method": "POST",   "path": "/api/voice_clone/upload",                   "auth": True, "description": "Upload a voice sample (rate: 10/min)"},
+        {"group": "VoiceClone", "method": "GET",    "path": "/api/voice_clone/list",                     "auth": True, "description": "List cloned voice profiles"},
+        {"group": "VoiceClone", "method": "DELETE", "path": "/api/voice_clone/{voice_id}",               "auth": True, "description": "Delete a cloned voice profile"},
+        {"group": "VoiceClone", "method": "POST",   "path": "/api/voice_clone/generate",                 "auth": True, "description": "Generate TTS with cloned voice (XTTS v2)"},
+        {"group": "VoiceClone", "method": "POST",   "path": "/api/voice_clone/save_profile",             "auth": True, "description": "Save a reusable voice profile"},
+        {"group": "VoiceClone", "method": "GET",    "path": "/api/voice_clone/profiles",                 "auth": True, "description": "List saved voice profiles"},
+        {"group": "VoiceClone", "method": "DELETE", "path": "/api/voice_clone/profiles/{profile_id}",   "auth": True, "description": "Delete a saved voice profile"},
+        {"group": "VoiceClone", "method": "POST",   "path": "/api/voice_clone/from_profile/{profile_id}","auth": True, "description": "Synthesise speech from a saved profile"},
+        {"group": "VoiceClone", "method": "GET",    "path": "/api/voice_clone/languages",               "auth": True, "description": "Languages supported by the cloning engine"},
+        # ── Audio enhancement ─────────────────────────────────────────────────
+        {"group": "Audio",  "method": "POST", "path": "/api/enhance_audio",       "auth": True, "description": "Apply effects (normalize, fade, reverb, pitch, speed)"},
+        {"group": "Audio",  "method": "POST", "path": "/api/transcribe",          "auth": True, "description": "Speech-to-text via local Whisper"},
+        # ── Music ─────────────────────────────────────────────────────────────
+        {"group": "Music",  "method": "POST", "path": "/api/generate_music",      "auth": True, "description": "Generate music locally (MusicGen)"},
+        {"group": "Music",  "method": "POST", "path": "/api/generate_music_fal",  "auth": True, "description": "Generate music via FAL.AI stable-audio"},
+        # ── Song generation ───────────────────────────────────────────────────
+        {"group": "Song",   "method": "POST", "path": "/api/generate_song",       "auth": True, "description": "Generate AI song with vocals (Bark, fully local)"},
+        {"group": "Song",   "method": "GET",  "path": "/api/song/voices",         "auth": True, "description": "List Bark voice presets"},
+        # ── Translation ───────────────────────────────────────────────────────
+        {"group": "Translation", "method": "POST", "path": "/api/translate",      "auth": True, "description": "Translate text to target language"},
+        {"group": "Translation", "method": "GET",  "path": "/api/languages",      "auth": False, "description": "List all supported translation languages"},
+        # ── Stats ─────────────────────────────────────────────────────────────
+        {"group": "Stats",  "method": "GET",  "path": "/api/stats",               "auth": True, "description": "User usage statistics"},
+    ]
+
+    for ep in endpoints:
+        ep["url"] = BASE_URL.rstrip("/") + ep["path"]
+
+    return {
+        "base_url": BASE_URL,
+        "docs_url": BASE_URL.rstrip("/") + "/docs",
+        "openapi_url": BASE_URL.rstrip("/") + "/openapi.json",
+        "auth_header": "Authorization: Bearer <access_token>",
+        "total": len(endpoints),
+        "endpoints": endpoints,
+    }
 
 
 # ---------------------------------------------------------------------------
