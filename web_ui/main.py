@@ -1,5 +1,6 @@
 import os
 import gc
+import io
 import time
 import shutil
 import subprocess
@@ -8,10 +9,9 @@ import secrets
 import re
 import logging
 import threading
-import zipfile
 from pathlib import Path
 from fastapi import FastAPI, HTTPException, Depends, Query, Request, UploadFile, File, Form
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 import tempfile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -70,15 +70,6 @@ else:
     _env_origins = os.environ.get("ALLOWED_ORIGINS", "")
     ALLOWED_ORIGINS = [o.strip() for o in _env_origins.split(",") if o.strip()]
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS,  # Specific origins only
-    allow_credentials=True,
-    allow_methods=["GET", "POST", "DELETE", "OPTIONS"],  # Specific methods
-    allow_headers=["Content-Type", "Authorization"],  # Specific headers
-    expose_headers=["Content-Length"],
-    max_age=3600,
-)
 
 # ---------------------------------------------------------------------------
 # Security Headers Middleware
@@ -186,6 +177,7 @@ init_db()
 # ---------------------------------------------------------------------------
 
 security = HTTPBearer()
+security_optional = HTTPBearer(auto_error=False)
 
 # ---------------------------------------------------------------------------
 # Password Validation
@@ -424,6 +416,38 @@ def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(securit
         raise HTTPException(status_code=401, detail="User not found.")
 
     return dict(user)  # return a dict, not None
+
+
+def get_current_user_audio(
+    token: str = Query(default=None),
+    credentials: HTTPAuthorizationCredentials = Depends(security_optional),
+):
+    """Auth for audio endpoints: accepts Bearer header OR ?token= query param."""
+    raw = None
+    if credentials:
+        raw = credentials.credentials
+    elif token:
+        raw = token
+    else:
+        raise HTTPException(status_code=401, detail="Not authenticated.")
+    try:
+        payload = jwt.decode(raw, JWT_SECRET, algorithms=[JWT_ALGORITHM],
+                             options={"verify_exp": True})
+        if payload.get("type") != "access":
+            raise HTTPException(status_code=401, detail="Invalid token type.")
+        user_id = int(payload["sub"])
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Token has expired.")
+    except jwt.InvalidTokenError:
+        raise HTTPException(status_code=401, detail="Invalid token.")
+    conn = get_db()
+    user = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+    conn.close()
+    if not user:
+        raise HTTPException(status_code=401, detail="User not found.")
+    return dict(user)
+
+
 def user_remaining(user: dict) -> int:
     """Returns generations remaining. -1 = unlimited (paid plan)."""
     if user["is_premium"]:
@@ -881,19 +905,29 @@ def generate_audio(req: GenerateRequest, request: Request, user=Depends(get_curr
 
     # All features free — no credit or premium gates
 
-    # Generate
+    # Generate to temp file, stream back, discard
     is_edge = model_info.get("engine") == "edge-tts"
     ext = ".mp3" if is_edge else ".wav"
-    filename = f"output_{int(time.time())}{ext}"
-    out_path = OUTPUTS_DIR / filename
+    media_type = "audio/mpeg" if is_edge else "audio/wav"
 
-    _synthesize_audio(
-        model_info, req.model, req.text, out_path,
-        speed=max(0.5, min(2.0, req.speed)),
-        pitch_hz=max(-10, min(10, req.pitch_hz)),
-    )
+    with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp:
+        tmp_path = Path(tmp.name)
 
-    # Increment usage
+    try:
+        _synthesize_audio(
+            model_info, req.model, req.text, tmp_path,
+            speed=max(0.5, min(2.0, req.speed)),
+            pitch_hz=max(-10, min(10, req.pitch_hz)),
+        )
+        audio_bytes = tmp_path.read_bytes()
+    finally:
+        try:
+            tmp_path.unlink()
+        except Exception:
+            pass
+
+    # Record history (no file stored)
+    now = datetime.utcnow().isoformat()
     conn = get_db()
     conn.execute(
         "UPDATE users SET generation_count = generation_count + 1 WHERE id = ?",
@@ -901,42 +935,14 @@ def generate_audio(req: GenerateRequest, request: Request, user=Depends(get_curr
     )
     conn.execute(
         "INSERT INTO generations (user_id, filename, model, text_snippet, created_at) VALUES (?,?,?,?,?)",
-        (
-            user["id"],
-            filename,
-            req.model,
-            req.text[:100],
-            datetime.utcnow().isoformat(),
-        ),
+        (user["id"], "", req.model, req.text[:100], now),
     )
     conn.commit()
-    updated_user = conn.execute(
-        "SELECT * FROM users WHERE id = ?", (user["id"],)
-    ).fetchone()
     conn.close()
 
-    remaining_credits = user_remaining(updated_user)
-    response_message = "Audio generated successfully!"
-    if updated_user["is_premium"]:
-        credits_info = "Unlimited (Premium User)"
-        generations_info = "Unlimited (Premium User)"
-    else:
-        credits_info = updated_user["credits"]
-        generations_info = remaining_credits
-
     logger.info(f"Audio generated for user {user['id']}: {req.model}")
-
-    return {
-        "success": True,
-        "status_message": response_message,
-        "filename": filename,
-        "audio_url": f"/api/audio/{filename}",
-        "download_url": f"/api/audio/{filename}/download",
-        "generation_count": updated_user["generation_count"],
-        "user_plan": "premium" if updated_user["is_premium"] else "free",
-        "credits": credits_info,
-        "generations_remaining": generations_info,
-    }
+    return Response(content=audio_bytes, media_type=media_type,
+                    headers={"Content-Disposition": f"inline; filename=output{ext}"})
 
 
 # ---------------------------------------------------------------------------
@@ -974,36 +980,21 @@ def get_history(
 def delete_history_entry(entry_id: int, user=Depends(get_current_user)):
     conn = get_db()
     row = conn.execute(
-        "SELECT * FROM generations WHERE id = ? AND user_id = ?", (entry_id, user["id"])
+        "SELECT id FROM generations WHERE id = ? AND user_id = ?", (entry_id, user["id"])
     ).fetchone()
     if not row:
         conn.close()
         raise HTTPException(status_code=404, detail="History entry not found.")
-    
-    file_path = OUTPUTS_DIR / row["filename"]
-    if file_path.exists():
-        file_path.unlink()
-    
     conn.execute("DELETE FROM generations WHERE id = ?", (entry_id,))
     conn.commit()
     conn.close()
-    
-    logger.info(f"History entry deleted for user {user['email']}: {entry_id}")
-    
+    logger.info(f"History entry {entry_id} deleted for user {user['email']}")
     return {"success": True, "deleted_id": entry_id}
 
 
 @app.delete("/api/history", summary="Clear all history for current user")
 def clear_history(user=Depends(get_current_user)):
     conn = get_db()
-    rows = conn.execute(
-        "SELECT filename FROM generations WHERE user_id = ?", (user["id"],)
-    ).fetchall()
-    for row in rows:
-        fp = OUTPUTS_DIR / row["filename"]
-        if fp.exists():
-            fp.unlink()
-    
     conn.execute("DELETE FROM generations WHERE user_id = ?", (user["id"],))
     conn.commit()
     conn.close()
@@ -1011,110 +1002,6 @@ def clear_history(user=Depends(get_current_user)):
     logger.info(f"All history cleared for user {user['email']}: {len(rows)} items")
     
     return {"success": True, "deleted_count": len(rows)}
-
-
-# ---------------------------------------------------------------------------
-# Batch TTS Generation
-# ---------------------------------------------------------------------------
-
-MAX_BATCH_LINES = 20
-MAX_BATCH_LINE_LENGTH = 500
-
-
-class BatchGenerateRequest(BaseModel):
-    texts: list
-    model: str
-    speed: float = 1.0
-    pitch_hz: int = 0
-
-
-@app.post("/api/batch_generate", summary="Batch TTS: generate multiple clips and return a ZIP download")
-@limiter.limit("5/minute")
-def batch_generate(req: BatchGenerateRequest, request: Request, user=Depends(get_current_user)):
-    texts = [t.strip() for t in req.texts if t.strip()]
-    if not texts:
-        raise HTTPException(status_code=400, detail="No text lines provided.")
-    if len(texts) > MAX_BATCH_LINES:
-        raise HTTPException(status_code=400, detail=f"Maximum {MAX_BATCH_LINES} lines per batch.")
-    for t in texts:
-        if len(t) > MAX_BATCH_LINE_LENGTH:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Each line must be under {MAX_BATCH_LINE_LENGTH} characters.",
-            )
-
-    voices_info = load_voices_json()
-    if req.model not in voices_info:
-        raise HTTPException(status_code=400, detail=f"Unknown model: {req.model}")
-    model_info = voices_info[req.model]
-
-    # All features free — no credit or premium gates
-
-    is_edge = model_info.get("engine") == "edge-tts"
-    ext = ".mp3" if is_edge else ".wav"
-    batch_ts = int(time.time())
-    generated_files: list[str] = []
-
-    conn = get_db()
-    now = datetime.utcnow().isoformat()
-    try:
-        for i, text in enumerate(texts):
-            filename = f"batch_{batch_ts}_{i + 1:03d}{ext}"
-            out_path = OUTPUTS_DIR / filename
-            _synthesize_audio(
-                model_info, req.model, text, out_path,
-                speed=max(0.5, min(2.0, req.speed)),
-                pitch_hz=max(-10, min(10, req.pitch_hz)),
-            )
-            conn.execute(
-                "INSERT INTO generations (user_id, filename, model, text_snippet, created_at) VALUES (?,?,?,?,?)",
-                (user["id"], filename, req.model, text[:100], now),
-            )
-            generated_files.append(filename)
-
-        conn.execute(
-            "UPDATE users SET generation_count = generation_count + ? WHERE id = ?",
-            (len(texts), user["id"]),
-        )
-        conn.commit()
-    except HTTPException:
-        conn.rollback()
-        conn.close()
-        raise
-    except Exception as e:
-        conn.rollback()
-        conn.close()
-        raise HTTPException(status_code=500, detail=f"Batch generation failed: {str(e)}")
-
-    # Package all clips into a ZIP archive
-    zip_filename = f"batch_{batch_ts}.zip"
-    zip_path = OUTPUTS_DIR / zip_filename
-    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-        for fname in generated_files:
-            fp = OUTPUTS_DIR / fname
-            if fp.exists():
-                zf.write(fp, fname)
-
-    # Register the ZIP so the download endpoint can serve it
-    conn.execute(
-        "INSERT INTO generations (user_id, filename, model, text_snippet, created_at) VALUES (?,?,?,?,?)",
-        (user["id"], zip_filename, "__batch_zip__", f"Batch {len(texts)} clips", now),
-    )
-    conn.commit()
-    conn.close()
-
-    logger.info(f"Batch TTS: {len(texts)} clips for user {user['email']}")
-
-    return {
-        "success": True,
-        "count": len(texts),
-        "zip_filename": zip_filename,
-        "zip_download_url": f"/api/audio/{zip_filename}/download",
-        "clips": [
-            {"index": i + 1, "filename": f, "url": f"/api/audio/{f}"}
-            for i, f in enumerate(generated_files)
-        ],
-    }
 
 
 # ---------------------------------------------------------------------------
@@ -1185,9 +1072,19 @@ def _prefetch_music_model():
         logger.warning(f"MusicGen pre-cache failed (will download on first use): {e}")
 
 
+def _prefetch_bark_model():
+    try:
+        from huggingface_hub import snapshot_download
+        snapshot_download(repo_id="suno/bark-small")
+        logger.info("Bark model files cached to disk")
+    except Exception as e:
+        logger.warning(f"Bark pre-cache failed (will download on first use): {e}")
+
+
 @app.on_event("startup")
 def startup_event():
     threading.Thread(target=_prefetch_music_model, daemon=True).start()
+    threading.Thread(target=_prefetch_bark_model, daemon=True).start()
 
 
 class MusicGenerateRequest(BaseModel):
@@ -1245,18 +1142,24 @@ def generate_music(request: MusicGenerateRequest, user=Depends(get_current_user)
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
 
-            filename = f"music_{int(time.time())}.wav"
-            out_path = OUTPUTS_DIR / filename
-            scipy.io.wavfile.write(str(out_path), rate=sampling_rate, data=audio_np)
+            buf = io.BytesIO()
+            scipy.io.wavfile.write(buf, rate=sampling_rate, data=audio_np)
+            audio_bytes = buf.getvalue()
+
+            conn = get_db()
+            conn.execute(
+                "UPDATE users SET generation_count = generation_count + 1 WHERE id = ?", (user["id"],)
+            )
+            conn.execute(
+                "INSERT INTO generations (user_id, filename, model, text_snippet, created_at) VALUES (?,?,?,?,?)",
+                (user["id"], "", "musicgen-small", request.prompt[:100], datetime.utcnow().isoformat()),
+            )
+            conn.commit()
+            conn.close()
 
             logger.info(f"Music generated for user {user['email']}")
-            return {
-                "success": True,
-                "filename": filename,
-                "audio_url": f"/api/audio/{filename}",
-                "download_url": f"/api/audio/{filename}/download",
-                "saved_location": str(out_path),
-            }
+            return Response(content=audio_bytes, media_type="audio/wav",
+                            headers={"Content-Disposition": "inline; filename=music.wav"})
         except ImportError as e:
             raise HTTPException(status_code=500, detail=f"MusicGen dependencies missing: {e}")
         except Exception as e:
@@ -1269,18 +1172,21 @@ def generate_music(request: MusicGenerateRequest, user=Depends(get_current_user)
 # ---------------------------------------------------------------------------
 
 
-class EnhanceAudioRequest(BaseModel):
-    filename: str
-    normalize: bool = True
-    fade_in: float = 0.0      # seconds (0–5)
-    fade_out: float = 0.0     # seconds (0–5)
-    reverb_amount: float = 0.0  # 0.0 to 1.0
-    pitch_steps: int = 0      # semitones (-6 to +6)
-    speed_factor: float = 1.0  # 0.5 to 2.0 (time-stretch, pitch preserved)
+ENHANCE_ALLOWED_EXT = {".wav", ".mp3", ".ogg", ".flac", ".m4a"}
+ENHANCE_MAX_SIZE = 50 * 1024 * 1024  # 50 MB
 
 
 @app.post("/api/enhance_audio", summary="Apply local audio effects (normalize, fade, reverb, pitch, speed)")
-def enhance_audio(request: EnhanceAudioRequest, user=Depends(get_current_user)):
+async def enhance_audio(
+    file: UploadFile = File(..., description="Audio file to enhance"),
+    normalize: bool = Form(default=True),
+    fade_in: float = Form(default=0.0),
+    fade_out: float = Form(default=0.0),
+    reverb_amount: float = Form(default=0.0),
+    pitch_steps: int = Form(default=0),
+    speed_factor: float = Form(default=1.0),
+    user=Depends(get_current_user),
+):
     try:
         import librosa
         import librosa.effects
@@ -1289,33 +1195,43 @@ def enhance_audio(request: EnhanceAudioRequest, user=Depends(get_current_user)):
     except ImportError as e:
         raise HTTPException(status_code=500, detail=f"Audio processing libraries missing: {e}")
 
-    # Validate and check ownership
-    src_path = validate_filename(request.filename, OUTPUTS_DIR)
-    conn = get_db()
-    row = conn.execute(
-        "SELECT id FROM generations WHERE filename = ? AND user_id = ?",
-        (request.filename, user["id"]),
-    ).fetchone()
-    conn.close()
-    if not row:
-        raise HTTPException(status_code=403, detail="Access denied.")
-    if not src_path.exists():
-        raise HTTPException(status_code=404, detail="File not found.")
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="No file provided.")
+    ext = Path(file.filename).suffix.lower()
+    if ext not in ENHANCE_ALLOWED_EXT:
+        raise HTTPException(status_code=400, detail=f"Unsupported format '{ext}'. Allowed: {ENHANCE_ALLOWED_EXT}")
+
+    content = await file.read()
+    if len(content) > ENHANCE_MAX_SIZE:
+        raise HTTPException(status_code=400, detail="File exceeds 50 MB limit.")
 
     # Clamp params
-    fade_in = max(0.0, min(5.0, request.fade_in))
-    fade_out = max(0.0, min(5.0, request.fade_out))
-    reverb_amount = max(0.0, min(1.0, request.reverb_amount))
-    pitch_steps = max(-6, min(6, request.pitch_steps))
-    speed_factor = max(0.5, min(2.0, request.speed_factor))
+    fade_in = max(0.0, min(5.0, fade_in))
+    fade_out = max(0.0, min(5.0, fade_out))
+    reverb_amount = max(0.0, min(1.0, reverb_amount))
+    pitch_steps = max(-6, min(6, pitch_steps))
+    speed_factor = max(0.5, min(2.0, speed_factor))
 
+    # Load from bytes via temp file
+    tmp_in_path = None
     try:
-        y, sr = librosa.load(str(src_path), sr=None, mono=False)
-        # Ensure shape is (channels, samples) for multi-channel support
-        if y.ndim == 1:
-            y = y[np.newaxis, :]  # (1, N)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to load audio: {e}")
+        with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp:
+            tmp.write(content)
+            tmp_in_path = tmp.name
+        try:
+            y, sr = librosa.load(tmp_in_path, sr=None, mono=False)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Failed to load audio: {e}")
+    finally:
+        if tmp_in_path:
+            try:
+                Path(tmp_in_path).unlink()
+            except Exception:
+                pass
+
+    # Ensure shape is (channels, samples) for multi-channel support
+    if y.ndim == 1:
+        y = y[np.newaxis, :]
 
     try:
         # Process each channel independently
@@ -1364,7 +1280,7 @@ def enhance_audio(request: EnhanceAudioRequest, user=Depends(get_current_user)):
         result = np.stack(processed_channels, axis=0)
 
         # 6. Normalize
-        if request.normalize:
+        if normalize:
             peak = np.max(np.abs(result))
             if peak > 0:
                 result = result / peak * 0.95
@@ -1378,20 +1294,17 @@ def enhance_audio(request: EnhanceAudioRequest, user=Depends(get_current_user)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Enhancement processing failed: {e}")
 
-    # Write output
-    stem = src_path.stem
-    enhanced_filename = f"enhanced_{stem}_{int(time.time())}.wav"
-    enhanced_path = OUTPUTS_DIR / enhanced_filename
+    # Write to BytesIO and stream back
+    buf = io.BytesIO()
     try:
-        sf.write(str(enhanced_path), result, sr)
+        sf.write(buf, result, sr, format="WAV")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to write enhanced audio: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to encode enhanced audio: {e}")
 
-    # Register in DB
     conn = get_db()
     conn.execute(
         "INSERT INTO generations (user_id, filename, model, text_snippet, created_at) VALUES (?,?,?,?,?)",
-        (user["id"], enhanced_filename, "__enhanced__", f"Enhanced: {request.filename}", datetime.utcnow().isoformat()),
+        (user["id"], "", "__enhanced__", f"Enhanced: {file.filename}", datetime.utcnow().isoformat()),
     )
     conn.execute(
         "UPDATE users SET generation_count = generation_count + 1 WHERE id = ?", (user["id"],)
@@ -1399,22 +1312,9 @@ def enhance_audio(request: EnhanceAudioRequest, user=Depends(get_current_user)):
     conn.commit()
     conn.close()
 
-    logger.info(f"Audio enhanced for user {user['email']}: {enhanced_filename}")
-
-    return {
-        "success": True,
-        "filename": enhanced_filename,
-        "audio_url": f"/api/audio/{enhanced_filename}",
-        "download_url": f"/api/audio/{enhanced_filename}/download",
-        "effects_applied": {
-            "normalize": request.normalize,
-            "fade_in": fade_in,
-            "fade_out": fade_out,
-            "reverb_amount": reverb_amount,
-            "pitch_steps": pitch_steps,
-            "speed_factor": speed_factor,
-        },
-    }
+    logger.info(f"Audio enhanced for user {user['email']}")
+    return Response(content=buf.getvalue(), media_type="audio/wav",
+                    headers={"Content-Disposition": "inline; filename=enhanced.wav"})
 
 
 # ---------------------------------------------------------------------------
@@ -1540,44 +1440,6 @@ async def transcribe_audio(
     }
 
 
-# ---------------------------------------------------------------------------
-# FAL.AI music generation (stable-audio)
-# ---------------------------------------------------------------------------
-
-FAL_API_KEY = os.environ.get("FAL_API_KEY")
-FAL_QUEUE_BASE = "https://queue.fal.run"
-FAL_MODEL = "fal-ai/stable-audio"
-
-MAX_FAL_PROMPT_LENGTH = 400
-FAL_POLL_INTERVAL = 3   # seconds between status checks
-FAL_POLL_TIMEOUT = 180  # max seconds to wait
-
-
-class FalMusicRequest(BaseModel):
-    prompt: str
-    duration: float = 30.0  # seconds, max ~190
-
-
-def _fal_headers() -> dict:
-    if not FAL_API_KEY:
-        raise HTTPException(status_code=503, detail="FAL_API_KEY not configured.")
-    return {
-        "Authorization": f"Key {FAL_API_KEY}",
-        "Content-Type": "application/json",
-    }
-
-
-def _fal_http(method: str, url: str, body: dict | None = None) -> dict:
-    data = json.dumps(body).encode() if body else None
-    req = urllib.request.Request(url, data=data, headers=_fal_headers(), method=method)
-    try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            return json.loads(resp.read().decode())
-    except urllib.error.HTTPError as e:
-        body_text = e.read().decode(errors="replace")
-        raise HTTPException(status_code=e.code, detail=f"FAL API error: {body_text}")
-    except urllib.error.URLError as e:
-        raise HTTPException(status_code=502, detail=f"FAL API unreachable: {e.reason}")
 
 
 # ---------------------------------------------------------------------------
@@ -1702,79 +1564,112 @@ def generate_song(request: SongGenerateRequest, user=Depends(get_current_user)):
         raise HTTPException(status_code=400, detail="quality must be 'small' or 'large'.")
 
     # Load model
-    processor, model = _load_bark(request.quality)
+    import torch
+    import numpy as np
+    import scipy.io.wavfile
+    from scipy.signal import resample_poly
+    from math import gcd
 
-    # Build script
+    processor, bark_model = _load_bark(request.quality)
     script = _format_song_script(request.lyrics, request.style)
     voice_preset = BARK_VOICE_PRESETS[request.voice_preset]
 
+    # ── Step 1: generate vocals with Bark ────────────────────────────────
     try:
-        import torch
-        import scipy.io.wavfile
-        import numpy as np
-
         inputs = processor(
-            text=[script],
-            voice_preset=voice_preset,
-            return_tensors="pt",
+            text=[script], voice_preset=voice_preset, return_tensors="pt"
         ).to(_bark_device)
-
         with torch.no_grad():
-            audio_array = model.generate(**inputs, do_sample=True)
-
-        audio_np = audio_array.cpu().numpy().squeeze().astype(np.float32)
-
-        # Normalise to avoid clipping
-        peak = np.max(np.abs(audio_np))
-        if peak > 0:
-            audio_np = audio_np / peak * 0.92
-
-        # Convert to int16 for WAV
-        audio_int16 = (audio_np * 32767).astype(np.int16)
-
-        sample_rate = model.generation_config.sample_rate
-
+            audio_array = bark_model.generate(**inputs, do_sample=True)
+        vocals_np = audio_array.cpu().numpy().squeeze().astype(np.float32)
+        vocal_sr = bark_model.generation_config.sample_rate
     except Exception as e:
-        logger.error(f"Bark generation error: {e}")
-        raise HTTPException(status_code=500, detail=f"Song generation failed: {e}")
+        logger.error(f"Bark vocals error: {e}")
+        raise HTTPException(status_code=500, detail=f"Vocal generation failed: {e}")
 
-    # Save file
-    filename = f"song_{int(time.time())}_{secrets.token_hex(4)}.wav"
-    out_path = OUTPUTS_DIR / filename
+    # Normalise vocals
+    peak = np.max(np.abs(vocals_np))
+    if peak > 0:
+        vocals_np = vocals_np / peak * 0.88
+
+    # ── Step 2: generate background music with MusicGen ──────────────────
+    music_np = None
+    music_sr = None
+    style_label = request.style if request.style != "none" else "ambient background music"
+    music_prompt = f"{style_label} instrumental background music, no vocals"
+    vocal_duration = len(vocals_np) / vocal_sr
+
     try:
-        import scipy.io.wavfile
-        scipy.io.wavfile.write(str(out_path), rate=sample_rate, data=audio_int16)
+        from transformers import AutoProcessor as MusicProcessor, MusicgenForConditionalGeneration
+        dtype = torch.float16 if torch.cuda.is_available() else torch.float32
+        mg_device = "cuda" if torch.cuda.is_available() else "cpu"
+        mg_proc = MusicProcessor.from_pretrained("facebook/musicgen-small")
+        mg_model = MusicgenForConditionalGeneration.from_pretrained(
+            "facebook/musicgen-small", torch_dtype=dtype, low_cpu_mem_usage=True
+        ).to(mg_device)
+        try:
+            mg_inputs = mg_proc(
+                text=[music_prompt], padding=True, return_tensors="pt"
+            ).to(mg_device)
+            mg_tokens = max(int(vocal_duration * 25.6), 128)
+            mg_out = mg_model.generate(**mg_inputs, max_new_tokens=mg_tokens)
+            music_np = mg_out[0, 0].cpu().numpy().astype(np.float32)
+            music_sr = mg_model.config.audio_encoder.sampling_rate
+        finally:
+            del mg_model
+            del mg_inputs
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to write audio: {e}")
+        logger.warning(f"Background music generation failed (vocals only): {e}")
 
-    # Record in DB + deduct credits
+    # ── Step 3: mix vocals + background ──────────────────────────────────
+    if music_np is not None and music_sr is not None:
+        # Resample music to vocal sample rate if needed
+        if music_sr != vocal_sr:
+            g = gcd(int(music_sr), int(vocal_sr))
+            music_np = resample_poly(music_np, int(vocal_sr) // g, int(music_sr) // g).astype(np.float32)
+
+        # Normalise background
+        bg_peak = np.max(np.abs(music_np))
+        if bg_peak > 0:
+            music_np = music_np / bg_peak * 0.38   # background at 38% level
+
+        # Trim or pad background to match vocal length
+        n = len(vocals_np)
+        if len(music_np) >= n:
+            music_np = music_np[:n]
+        else:
+            repeats = -(-n // len(music_np))   # ceiling div
+            music_np = np.tile(music_np, repeats)[:n]
+
+        mixed = np.clip(vocals_np + music_np, -1.0, 1.0)
+    else:
+        mixed = vocals_np
+
+    # Convert to int16 and stream back
+    audio_int16 = (mixed * 32767).astype(np.int16)
+    buf = io.BytesIO()
+    scipy.io.wavfile.write(buf, rate=vocal_sr, data=audio_int16)
+    audio_bytes = buf.getvalue()
+
+    # Record history
     now = datetime.utcnow().isoformat()
     conn = get_db()
     conn.execute(
-        "UPDATE users SET generation_count = generation_count + 1 WHERE id = ?",
-        (user["id"],),
+        "UPDATE users SET generation_count = generation_count + 1 WHERE id = ?", (user["id"],)
     )
     conn.execute(
         "INSERT INTO generations (user_id, filename, model, text_snippet, created_at) VALUES (?,?,?,?,?)",
-        (user["id"], filename, f"bark-{request.quality}", request.lyrics[:100], now),
+        (user["id"], "", f"bark-{request.quality}+musicgen", request.lyrics[:100], now),
     )
     conn.commit()
-    updated = conn.execute("SELECT * FROM users WHERE id = ?", (user["id"],)).fetchone()
     conn.close()
 
-    logger.info(f"Song generated for user {user['email']}: {filename}")
-
-    return {
-        "success": True,
-        "filename": filename,
-        "audio_url": f"/api/audio/{filename}",
-        "download_url": f"/api/audio/{filename}/download",
-        "script_used": script,
-        "voice_preset": voice_preset,
-        "sample_rate": sample_rate,
-        "credits": updated["credits"] if not updated["is_premium"] else "Unlimited",
-        "generations_remaining": user_remaining(updated),
-    }
+    logger.info(f"Song generated for user {user['email']} (vocals + background)")
+    return Response(content=audio_bytes, media_type="audio/wav",
+                    headers={"Content-Disposition": "inline; filename=song.wav"})
 
 
 @app.get("/api/song/voices", summary="List available Bark voice presets for song generation")
@@ -2070,94 +1965,6 @@ def generate_with_cloned_voice(
     }
 
 
-def _download_to_outputs(audio_url: str, filename: str) -> Path:
-    out_path = OUTPUTS_DIR / filename
-    try:
-        urllib.request.urlretrieve(audio_url, out_path)
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Failed to download audio: {e}")
-    return out_path
-
-
-@app.post("/api/generate_music_fal", summary="Generate music with FAL.AI stable-audio")
-def generate_music_fal(request: FalMusicRequest, user=Depends(get_current_user)):
-    # Validate
-    if not request.prompt or not request.prompt.strip():
-        raise HTTPException(status_code=400, detail="Prompt cannot be empty.")
-    if len(request.prompt) > MAX_FAL_PROMPT_LENGTH:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Prompt exceeds maximum length of {MAX_FAL_PROMPT_LENGTH} characters."
-        )
-    if not (1.0 <= request.duration <= 190.0):
-        raise HTTPException(status_code=400, detail="Duration must be between 1 and 190 seconds.")
-
-    # All features free — no credit gate
-
-    # Submit to FAL queue
-    submit = _fal_http(
-        "POST",
-        f"{FAL_QUEUE_BASE}/{FAL_MODEL}",
-        {"prompt": request.prompt.strip(), "seconds_total": request.duration},
-    )
-    request_id = submit.get("request_id")
-    if not request_id:
-        raise HTTPException(status_code=502, detail=f"FAL did not return a request_id: {submit}")
-
-    # Poll for completion
-    deadline = time.time() + FAL_POLL_TIMEOUT
-    result = None
-    while time.time() < deadline:
-        time.sleep(FAL_POLL_INTERVAL)
-        status_data = _fal_http(
-            "GET",
-            f"{FAL_QUEUE_BASE}/{FAL_MODEL}/requests/{request_id}/status",
-        )
-        status = (status_data.get("status") or "").upper()
-        if status == "COMPLETED":
-            result = _fal_http(
-                "GET",
-                f"{FAL_QUEUE_BASE}/{FAL_MODEL}/requests/{request_id}",
-            )
-            break
-        if status in ("FAILED", "CANCELLED"):
-            raise HTTPException(status_code=500, detail=f"FAL generation failed: {status_data}")
-
-    if not result:
-        raise HTTPException(status_code=504, detail="FAL generation timed out.")
-
-    audio_url = (result.get("audio_file") or {}).get("url")
-    if not audio_url:
-        raise HTTPException(status_code=502, detail=f"FAL returned no audio URL: {result}")
-
-    # Download and save
-    filename = f"fal_music_{int(time.time())}_{secrets.token_hex(4)}.wav"
-    _download_to_outputs(audio_url, filename)
-
-    now = datetime.utcnow().isoformat()
-    conn = get_db()
-    conn.execute(
-        "UPDATE users SET generation_count = generation_count + 1 WHERE id = ?",
-        (user["id"],),
-    )
-    conn.execute(
-        "INSERT INTO generations (user_id, filename, model, text_snippet, created_at) VALUES (?,?,?,?,?)",
-        (user["id"], filename, "fal-stable-audio", request.prompt[:100], now),
-    )
-    conn.commit()
-    updated_user = conn.execute("SELECT * FROM users WHERE id = ?", (user["id"],)).fetchone()
-    conn.close()
-
-    logger.info(f"FAL music generated for user {user['email']}: {filename}")
-
-    return {
-        "success": True,
-        "filename": filename,
-        "audio_url": f"/api/audio/{filename}",
-        "download_url": f"/api/audio/{filename}/download",
-        "credits": updated_user["credits"] if not updated_user["is_premium"] else "Unlimited",
-        "generations_remaining": user_remaining(updated_user),
-    }
 
 
 # ---------------------------------------------------------------------------
@@ -2239,59 +2046,52 @@ async def voice_clone_generate(
     if len(content) > MAX_REFERENCE_AUDIO_SIZE:
         raise HTTPException(status_code=400, detail="Reference audio exceeds 25 MB limit.")
 
-    # Write reference to a temp file (XTTS needs a file path)
+    # Write reference to temp, synthesise to temp, stream back
     tmp_ref_path = None
-    out_filename = f"clone_{int(time.time())}_{secrets.token_hex(4)}.wav"
-    out_path = OUTPUTS_DIR / out_filename
+    tmp_out_path = None
     try:
         with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp:
             tmp.write(content)
             tmp_ref_path = tmp.name
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_out:
+            tmp_out_path = tmp_out.name
 
         tts = _load_xtts()
         tts.tts_to_file(
             text=text.strip(),
             speaker_wav=tmp_ref_path,
             language=language,
-            file_path=str(out_path),
+            file_path=tmp_out_path,
         )
+        audio_bytes = Path(tmp_out_path).read_bytes()
     except HTTPException:
         raise
     except Exception as e:
         logger.error(f"Voice clone generate error for {user['email']}: {e}")
         raise HTTPException(status_code=500, detail=f"Voice cloning failed: {e}")
     finally:
-        if tmp_ref_path:
-            try:
-                Path(tmp_ref_path).unlink()
-            except Exception:
-                pass
+        for p in (tmp_ref_path, tmp_out_path):
+            if p:
+                try:
+                    Path(p).unlink()
+                except Exception:
+                    pass
 
-    # Record usage
     now = datetime.utcnow().isoformat()
     conn = get_db()
     conn.execute(
-        "UPDATE users SET generation_count = generation_count + 1 WHERE id = ?",
-        (user["id"],),
+        "UPDATE users SET generation_count = generation_count + 1 WHERE id = ?", (user["id"],)
     )
     conn.execute(
         "INSERT INTO generations (user_id, filename, model, text_snippet, created_at) VALUES (?,?,?,?,?)",
-        (user["id"], out_filename, "__voice_clone__", text[:100], now),
+        (user["id"], "", "__voice_clone__", text[:100], now),
     )
     conn.commit()
-    updated = conn.execute("SELECT * FROM users WHERE id = ?", (user["id"],)).fetchone()
     conn.close()
 
-    logger.info(f"Voice clone generated for {user['email']}: {out_filename}")
-
-    return {
-        "success": True,
-        "filename": out_filename,
-        "audio_url": f"/api/audio/{out_filename}",
-        "download_url": f"/api/audio/{out_filename}/download",
-        "credits": updated["credits"] if not updated["is_premium"] else "Unlimited",
-        "generations_remaining": user_remaining(updated),
-    }
+    logger.info(f"Voice clone generated for {user['email']}")
+    return Response(content=audio_bytes, media_type="audio/wav",
+                    headers={"Content-Disposition": "inline; filename=clone.wav"})
 
 
 # ── save a reusable voice profile ──
@@ -2454,49 +2254,46 @@ def voice_clone_from_profile(
     if not ref_path.exists():
         raise HTTPException(status_code=404, detail="Reference audio file missing from server.")
 
-    # Synthesise
-    out_filename = f"clone_{int(time.time())}_{secrets.token_hex(4)}.wav"
-    out_path = OUTPUTS_DIR / out_filename
+    # Synthesise to temp file, stream back
+    tmp_out_path = None
     try:
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_out:
+            tmp_out_path = tmp_out.name
         tts = _load_xtts()
         tts.tts_to_file(
             text=request.text.strip(),
             speaker_wav=str(ref_path),
             language=language,
-            file_path=str(out_path),
+            file_path=tmp_out_path,
         )
+        audio_bytes = Path(tmp_out_path).read_bytes()
     except HTTPException:
         raise
     except Exception as e:
         logger.error(f"Voice clone from profile error for {user['email']}: {e}")
         raise HTTPException(status_code=500, detail=f"Voice cloning failed: {e}")
+    finally:
+        if tmp_out_path:
+            try:
+                Path(tmp_out_path).unlink()
+            except Exception:
+                pass
 
-    # Record usage
     now = datetime.utcnow().isoformat()
     conn = get_db()
     conn.execute(
-        "UPDATE users SET generation_count = generation_count + 1 WHERE id = ?",
-        (user["id"],),
+        "UPDATE users SET generation_count = generation_count + 1 WHERE id = ?", (user["id"],)
     )
     conn.execute(
         "INSERT INTO generations (user_id, filename, model, text_snippet, created_at) VALUES (?,?,?,?,?)",
-        (user["id"], out_filename, f"__voice_clone_profile_{profile_id}__", request.text[:100], now),
+        (user["id"], "", f"__voice_clone_profile_{profile_id}__", request.text[:100], now),
     )
     conn.commit()
-    updated = conn.execute("SELECT * FROM users WHERE id = ?", (user["id"],)).fetchone()
     conn.close()
 
-    logger.info(f"Voice clone from profile {profile_id} for {user['email']}: {out_filename}")
-
-    return {
-        "success": True,
-        "filename": out_filename,
-        "audio_url": f"/api/audio/{out_filename}",
-        "download_url": f"/api/audio/{out_filename}/download",
-        "voice_profile": profile["name"],
-        "credits": updated["credits"] if not updated["is_premium"] else "Unlimited",
-        "generations_remaining": user_remaining(updated),
-    }
+    logger.info(f"Voice clone from profile {profile_id} for {user['email']}")
+    return Response(content=audio_bytes, media_type="audio/wav",
+                    headers={"Content-Disposition": "inline; filename=clone.wav"})
 
 
 # ── list supported languages ──
@@ -2512,7 +2309,7 @@ def voice_clone_languages(user=Depends(get_current_user)):
 
 
 @app.get("/api/audio/{filename}", summary="Stream audio file")
-def get_audio(filename: str, user=Depends(get_current_user)):
+def get_audio(filename: str, user=Depends(get_current_user_audio)):
     """Stream audio file with authorization check."""
     
     # Validate filename
@@ -2541,7 +2338,7 @@ def get_audio(filename: str, user=Depends(get_current_user)):
 
 
 @app.get("/api/audio/{filename}/download", summary="Download audio file")
-def download_audio(filename: str, user=Depends(get_current_user)):
+def download_audio(filename: str, user=Depends(get_current_user_audio)):
     """Download audio file with authorization check."""
 
     # Validate filename
