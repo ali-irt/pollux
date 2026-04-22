@@ -30,8 +30,7 @@ from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 load_dotenv()
 ssl._create_default_https_context = ssl._create_unverified_context
-
-from db import get_db, init_db
+from web_ui.db import get_db, init_db
 
 # ---------------------------------------------------------------------------
 # Logging Configuration
