@@ -926,23 +926,30 @@ def generate_audio(req: GenerateRequest, request: Request, user=Depends(get_curr
         except Exception:
             pass
 
-    # Record history (no file stored)
     now = datetime.utcnow().isoformat()
     conn = get_db()
     conn.execute(
         "UPDATE users SET generation_count = generation_count + 1 WHERE id = ?",
         (user["id"],),
     )
-    conn.execute(
-        "INSERT INTO generations (user_id, filename, model, text_snippet, created_at) VALUES (?,?,?,?,?)",
-        (user["id"], "", req.model, req.text[:100], now),
+    cursor = conn.execute(
+        "INSERT INTO generations (user_id, filename, model, text_snippet, created_at, audio_data, audio_format)"
+        " VALUES (?,?,?,?,?,?,?)",
+        (user["id"], "", req.model, req.text[:100], now, audio_bytes, ext.lstrip(".")),
     )
+    generation_id = cursor.lastrowid
     conn.commit()
     conn.close()
 
     logger.info(f"Audio generated for user {user['id']}: {req.model}")
-    return Response(content=audio_bytes, media_type=media_type,
-                    headers={"Content-Disposition": f"inline; filename=output{ext}"})
+    return Response(
+        content=audio_bytes,
+        media_type=media_type,
+        headers={
+            "Content-Disposition": f"inline; filename=output{ext}",
+            "X-Generation-Id": str(generation_id),
+        },
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1146,20 +1153,29 @@ def generate_music(request: MusicGenerateRequest, user=Depends(get_current_user)
             scipy.io.wavfile.write(buf, rate=sampling_rate, data=audio_np)
             audio_bytes = buf.getvalue()
 
+            now = datetime.utcnow().isoformat()
             conn = get_db()
             conn.execute(
                 "UPDATE users SET generation_count = generation_count + 1 WHERE id = ?", (user["id"],)
             )
-            conn.execute(
-                "INSERT INTO generations (user_id, filename, model, text_snippet, created_at) VALUES (?,?,?,?,?)",
-                (user["id"], "", "musicgen-small", request.prompt[:100], datetime.utcnow().isoformat()),
+            cur = conn.execute(
+                "INSERT INTO generations (user_id, filename, model, text_snippet, created_at, audio_data, audio_format)"
+                " VALUES (?,?,?,?,?,?,?)",
+                (user["id"], "", "musicgen-small", request.prompt[:100], now, audio_bytes, "wav"),
             )
+            gen_id = cur.lastrowid
             conn.commit()
             conn.close()
 
             logger.info(f"Music generated for user {user['email']}")
-            return Response(content=audio_bytes, media_type="audio/wav",
-                            headers={"Content-Disposition": "inline; filename=music.wav"})
+            return Response(
+                content=audio_bytes,
+                media_type="audio/wav",
+                headers={
+                    "Content-Disposition": "inline; filename=music.wav",
+                    "X-Generation-Id": str(gen_id),
+                },
+            )
         except ImportError as e:
             raise HTTPException(status_code=500, detail=f"MusicGen dependencies missing: {e}")
         except Exception as e:
@@ -1301,11 +1317,15 @@ async def enhance_audio(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to encode enhanced audio: {e}")
 
+    audio_bytes = buf.getvalue()
+    now = datetime.utcnow().isoformat()
     conn = get_db()
-    conn.execute(
-        "INSERT INTO generations (user_id, filename, model, text_snippet, created_at) VALUES (?,?,?,?,?)",
-        (user["id"], "", "__enhanced__", f"Enhanced: {file.filename}", datetime.utcnow().isoformat()),
+    cur = conn.execute(
+        "INSERT INTO generations (user_id, filename, model, text_snippet, created_at, audio_data, audio_format)"
+        " VALUES (?,?,?,?,?,?,?)",
+        (user["id"], "", "__enhanced__", f"Enhanced: {file.filename}", now, audio_bytes, "wav"),
     )
+    gen_id = cur.lastrowid
     conn.execute(
         "UPDATE users SET generation_count = generation_count + 1 WHERE id = ?", (user["id"],)
     )
@@ -1313,8 +1333,14 @@ async def enhance_audio(
     conn.close()
 
     logger.info(f"Audio enhanced for user {user['email']}")
-    return Response(content=buf.getvalue(), media_type="audio/wav",
-                    headers={"Content-Disposition": "inline; filename=enhanced.wav"})
+    return Response(
+        content=audio_bytes,
+        media_type="audio/wav",
+        headers={
+            "Content-Disposition": "inline; filename=enhanced.wav",
+            "X-Generation-Id": str(gen_id),
+        },
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1654,22 +1680,29 @@ def generate_song(request: SongGenerateRequest, user=Depends(get_current_user)):
     scipy.io.wavfile.write(buf, rate=vocal_sr, data=audio_int16)
     audio_bytes = buf.getvalue()
 
-    # Record history
     now = datetime.utcnow().isoformat()
     conn = get_db()
     conn.execute(
         "UPDATE users SET generation_count = generation_count + 1 WHERE id = ?", (user["id"],)
     )
-    conn.execute(
-        "INSERT INTO generations (user_id, filename, model, text_snippet, created_at) VALUES (?,?,?,?,?)",
-        (user["id"], "", f"bark-{request.quality}+musicgen", request.lyrics[:100], now),
+    cur = conn.execute(
+        "INSERT INTO generations (user_id, filename, model, text_snippet, created_at, audio_data, audio_format)"
+        " VALUES (?,?,?,?,?,?,?)",
+        (user["id"], "", f"bark-{request.quality}+musicgen", request.lyrics[:100], now, audio_bytes, "wav"),
     )
+    gen_id = cur.lastrowid
     conn.commit()
     conn.close()
 
     logger.info(f"Song generated for user {user['email']} (vocals + background)")
-    return Response(content=audio_bytes, media_type="audio/wav",
-                    headers={"Content-Disposition": "inline; filename=song.wav"})
+    return Response(
+        content=audio_bytes,
+        media_type="audio/wav",
+        headers={
+            "Content-Disposition": "inline; filename=song.wav",
+            "X-Generation-Id": str(gen_id),
+        },
+    )
 
 
 @app.get("/api/song/voices", summary="List available Bark voice presets for song generation")
@@ -1921,43 +1954,51 @@ def generate_with_cloned_voice(
     # Load XTTS model (lazy)
     tts = _load_xtts()
 
-    # Generate
-    filename = f"clone_{int(time.time())}_{secrets.token_hex(4)}.wav"
-    out_path = OUTPUTS_DIR / filename
-
+    # Synthesise to temp file, read bytes, then discard file
+    tmp_out_path = None
     try:
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_out:
+            tmp_out_path = tmp_out.name
         tts.tts_to_file(
             text=request.text.strip(),
             speaker_wav=str(sample_path),
             language=lang,
-            file_path=str(out_path),
+            file_path=tmp_out_path,
         )
+        audio_bytes = Path(tmp_out_path).read_bytes()
     except Exception as e:
         logger.error(f"XTTS generation error: {e}")
         raise HTTPException(status_code=500, detail=f"Voice cloning generation failed: {e}")
+    finally:
+        if tmp_out_path:
+            try:
+                Path(tmp_out_path).unlink()
+            except Exception:
+                pass
 
-    # Deduct credits + record
     now = datetime.utcnow().isoformat()
     conn = get_db()
     conn.execute(
         "UPDATE users SET generation_count = generation_count + 1 WHERE id = ?",
         (user["id"],),
     )
-    conn.execute(
-        "INSERT INTO generations (user_id, filename, model, text_snippet, created_at) VALUES (?,?,?,?,?)",
-        (user["id"], filename, f"xtts-v2-clone:{row['name']}", request.text[:100], now),
+    cur = conn.execute(
+        "INSERT INTO generations (user_id, filename, model, text_snippet, created_at, audio_data, audio_format)"
+        " VALUES (?,?,?,?,?,?,?)",
+        (user["id"], "", f"xtts-v2-clone:{row['name']}", request.text[:100], now, audio_bytes, "wav"),
     )
+    generation_id = cur.lastrowid
     conn.commit()
     updated = conn.execute("SELECT * FROM users WHERE id = ?", (user["id"],)).fetchone()
     conn.close()
 
-    logger.info(f"Cloned voice TTS for user {user['email']}: voice='{row['name']}', file={filename}")
+    logger.info(f"Cloned voice TTS for user {user['email']}: voice='{row['name']}', gen={generation_id}")
 
     return {
         "success": True,
-        "filename": filename,
-        "audio_url": f"/api/audio/{filename}",
-        "download_url": f"/api/audio/{filename}/download",
+        "generation_id": generation_id,
+        "audio_url": f"/api/audio/{generation_id}",
+        "download_url": f"/api/audio/{generation_id}/download",
         "voice_name": row["name"],
         "language": lang,
         "credits": updated["credits"] if not updated["is_premium"] else "Unlimited",
@@ -2082,16 +2123,24 @@ async def voice_clone_generate(
     conn.execute(
         "UPDATE users SET generation_count = generation_count + 1 WHERE id = ?", (user["id"],)
     )
-    conn.execute(
-        "INSERT INTO generations (user_id, filename, model, text_snippet, created_at) VALUES (?,?,?,?,?)",
-        (user["id"], "", "__voice_clone__", text[:100], now),
+    cur = conn.execute(
+        "INSERT INTO generations (user_id, filename, model, text_snippet, created_at, audio_data, audio_format)"
+        " VALUES (?,?,?,?,?,?,?)",
+        (user["id"], "", "__voice_clone__", text[:100], now, audio_bytes, "wav"),
     )
+    gen_id = cur.lastrowid
     conn.commit()
     conn.close()
 
     logger.info(f"Voice clone generated for {user['email']}")
-    return Response(content=audio_bytes, media_type="audio/wav",
-                    headers={"Content-Disposition": "inline; filename=clone.wav"})
+    return Response(
+        content=audio_bytes,
+        media_type="audio/wav",
+        headers={
+            "Content-Disposition": "inline; filename=clone.wav",
+            "X-Generation-Id": str(gen_id),
+        },
+    )
 
 
 # ── save a reusable voice profile ──
@@ -2284,16 +2333,24 @@ def voice_clone_from_profile(
     conn.execute(
         "UPDATE users SET generation_count = generation_count + 1 WHERE id = ?", (user["id"],)
     )
-    conn.execute(
-        "INSERT INTO generations (user_id, filename, model, text_snippet, created_at) VALUES (?,?,?,?,?)",
-        (user["id"], "", f"__voice_clone_profile_{profile_id}__", request.text[:100], now),
+    cur = conn.execute(
+        "INSERT INTO generations (user_id, filename, model, text_snippet, created_at, audio_data, audio_format)"
+        " VALUES (?,?,?,?,?,?,?)",
+        (user["id"], "", f"__voice_clone_profile_{profile_id}__", request.text[:100], now, audio_bytes, "wav"),
     )
+    gen_id = cur.lastrowid
     conn.commit()
     conn.close()
 
     logger.info(f"Voice clone from profile {profile_id} for {user['email']}")
-    return Response(content=audio_bytes, media_type="audio/wav",
-                    headers={"Content-Disposition": "inline; filename=clone.wav"})
+    return Response(
+        content=audio_bytes,
+        media_type="audio/wav",
+        headers={
+            "Content-Disposition": "inline; filename=clone.wav",
+            "X-Generation-Id": str(gen_id),
+        },
+    )
 
 
 # ── list supported languages ──
@@ -2308,98 +2365,73 @@ def voice_clone_languages(user=Depends(get_current_user)):
 # ---------------------------------------------------------------------------
 
 
-@app.get("/api/audio/{filename}", summary="Stream audio file")
-def get_audio(filename: str, user=Depends(get_current_user_audio)):
-    """Stream audio file with authorization check."""
-    
-    # Validate filename
-    file_path = validate_filename(filename, OUTPUTS_DIR)
-    
-    # Verify file ownership
+@app.get("/api/audio/{generation_id}", summary="Stream audio from DB")
+def get_audio(generation_id: int, user=Depends(get_current_user_audio)):
     conn = get_db()
-    generation = conn.execute(
-        "SELECT id FROM generations WHERE filename = ? AND user_id = ?",
-        (filename, user["id"])
-    ).fetchone()
-    conn.close()
-    
-    if not generation:
-        raise HTTPException(status_code=403, detail="Access denied.")
-    
-    if not file_path.exists():
-        raise HTTPException(status_code=404, detail="File not found.")
-    
-    media_type = (
-        "application/zip" if filename.endswith(".zip")
-        else "audio/mpeg" if filename.endswith(".mp3")
-        else "audio/wav"
-    )
-    return FileResponse(file_path, media_type=media_type)
-
-
-@app.get("/api/audio/{filename}/download", summary="Download audio file")
-def download_audio(filename: str, user=Depends(get_current_user_audio)):
-    """Download audio file with authorization check."""
-
-    # Validate filename
-    file_path = validate_filename(filename, OUTPUTS_DIR)
-
-    # Verify file ownership
-    conn = get_db()
-    generation = conn.execute(
-        "SELECT id FROM generations WHERE filename = ? AND user_id = ?",
-        (filename, user["id"])
+    row = conn.execute(
+        "SELECT audio_data, audio_format FROM generations WHERE id = ? AND user_id = ?",
+        (generation_id, user["id"]),
     ).fetchone()
     conn.close()
 
-    if not generation:
-        raise HTTPException(status_code=403, detail="Access denied.")
+    if not row or not row["audio_data"]:
+        raise HTTPException(status_code=404, detail="Audio not found.")
 
-    if not file_path.exists():
-        raise HTTPException(status_code=404, detail="File not found.")
-
-    media_type = (
-        "application/zip" if filename.endswith(".zip")
-        else "audio/mpeg" if filename.endswith(".mp3")
-        else "audio/wav"
-    )
-    return FileResponse(
-        file_path,
+    fmt = row["audio_format"] or "wav"
+    media_type = "audio/mpeg" if fmt == "mp3" else "audio/wav"
+    return Response(
+        content=bytes(row["audio_data"]),
         media_type=media_type,
-        filename=filename,
-        headers={"Content-Disposition": f"attachment; filename={filename}"},
+        headers={"Content-Disposition": f"inline; filename=output.{fmt}"},
     )
 
 
-@app.delete("/api/audio/{filename}", summary="Delete an audio file")
-def delete_audio(filename: str, user=Depends(get_current_user)):
-    """Delete audio file with authorization check."""
-    
-    # Validate filename
-    file_path = validate_filename(filename, OUTPUTS_DIR)
-    
-    # Verify file ownership
+@app.get("/api/audio/{generation_id}/download", summary="Download audio from DB and remove from storage")
+def download_audio(generation_id: int, user=Depends(get_current_user_audio)):
+    conn = get_db()
+    row = conn.execute(
+        "SELECT id, audio_data, audio_format FROM generations WHERE id = ? AND user_id = ?",
+        (generation_id, user["id"]),
+    ).fetchone()
+
+    if not row or not row["audio_data"]:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Audio not found.")
+
+    audio_bytes = bytes(row["audio_data"])
+    fmt = row["audio_format"] or "wav"
+    media_type = "audio/mpeg" if fmt == "mp3" else "audio/wav"
+
+    # Delete from DB once exported to the client
+    conn.execute("DELETE FROM generations WHERE id = ?", (row["id"],))
+    conn.commit()
+    conn.close()
+
+    logger.info(f"Audio {generation_id} exported and removed from DB for user {user['email']}")
+    return Response(
+        content=audio_bytes,
+        media_type=media_type,
+        headers={"Content-Disposition": f"attachment; filename=output_{generation_id}.{fmt}"},
+    )
+
+
+@app.delete("/api/audio/{generation_id}", summary="Delete audio from DB")
+def delete_audio(generation_id: int, user=Depends(get_current_user)):
     conn = get_db()
     generation = conn.execute(
-        "SELECT id FROM generations WHERE filename = ? AND user_id = ?",
-        (filename, user["id"])
+        "SELECT id FROM generations WHERE id = ? AND user_id = ?",
+        (generation_id, user["id"]),
     ).fetchone()
-    
+
     if not generation:
         conn.close()
         raise HTTPException(status_code=403, detail="Access denied.")
-    
-    # Delete file
-    if file_path.exists():
-        file_path.unlink()
-    
-    # Delete database record
+
     conn.execute("DELETE FROM generations WHERE id = ?", (generation["id"],))
     conn.commit()
     conn.close()
-    
-    logger.info(f"Audio file deleted for user {user['email']}: {filename}")
-    
+
+    logger.info(f"Audio {generation_id} deleted for user {user['email']}")
     return {"success": True, "deleted_id": generation["id"]}
 
 
@@ -2499,9 +2531,9 @@ def list_endpoints():
         {"group": "History","method": "DELETE", "path": "/api/history/{entry_id}","auth": True,  "description": "Delete a single history entry"},
         {"group": "History","method": "DELETE", "path": "/api/history",           "auth": True,  "description": "Clear all history"},
         # ── Audio files ───────────────────────────────────────────────────────
-        {"group": "Audio", "method": "GET",    "path": "/api/audio/{filename}",           "auth": True, "description": "Stream audio file"},
-        {"group": "Audio", "method": "GET",    "path": "/api/audio/{filename}/download",  "auth": True, "description": "Download audio file"},
-        {"group": "Audio", "method": "DELETE", "path": "/api/audio/{filename}",           "auth": True, "description": "Delete audio file"},
+        {"group": "Audio", "method": "GET",    "path": "/api/audio/{generation_id}",           "auth": True, "description": "Stream audio from DB"},
+        {"group": "Audio", "method": "GET",    "path": "/api/audio/{generation_id}/download",  "auth": True, "description": "Download audio from DB (removes from storage after export)"},
+        {"group": "Audio", "method": "DELETE", "path": "/api/audio/{generation_id}",           "auth": True, "description": "Delete audio from DB"},
         # ── Voice Cloning ─────────────────────────────────────────────────────
         {"group": "VoiceClone", "method": "POST",   "path": "/api/voice_clone/upload",                   "auth": True, "description": "Upload a voice sample (rate: 10/min)"},
         {"group": "VoiceClone", "method": "GET",    "path": "/api/voice_clone/list",                     "auth": True, "description": "List cloned voice profiles"},
