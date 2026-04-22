@@ -1064,28 +1064,74 @@ def translate_text(request: TranslateRequest, user=Depends(get_current_user)):
 # Music generation (premium only)
 # ---------------------------------------------------------------------------
 
-_music_cache_ready = False
-_music_load_lock = threading.Lock()
+_musicgen_processor = None
+_musicgen_model = None
+_musicgen_lock = threading.Lock()
+
+
+def _is_hf_cached(repo_id: str) -> bool:
+    """Return True if the HuggingFace repo is already in the local disk cache."""
+    try:
+        from huggingface_hub import snapshot_download
+        snapshot_download(repo_id=repo_id, local_files_only=True)
+        return True
+    except Exception:
+        return False
 
 
 def _prefetch_music_model():
-    global _music_cache_ready
     try:
+        if _is_hf_cached("facebook/musicgen-small"):
+            logger.info("MusicGen already cached — skipping download")
+            return
         from huggingface_hub import snapshot_download
         snapshot_download(repo_id="facebook/musicgen-small")
-        _music_cache_ready = True
-        logger.info("MusicGen model files cached to disk")
+        logger.info("MusicGen model files downloaded")
     except Exception as e:
         logger.warning(f"MusicGen pre-cache failed (will download on first use): {e}")
 
 
 def _prefetch_bark_model():
     try:
+        if _is_hf_cached("suno/bark-small"):
+            logger.info("Bark already cached — skipping download")
+            return
         from huggingface_hub import snapshot_download
         snapshot_download(repo_id="suno/bark-small")
-        logger.info("Bark model files cached to disk")
+        logger.info("Bark model files downloaded")
     except Exception as e:
         logger.warning(f"Bark pre-cache failed (will download on first use): {e}")
+
+
+def _load_musicgen():
+    """Load MusicGen once and keep it in memory for all subsequent calls."""
+    global _musicgen_processor, _musicgen_model
+    with _musicgen_lock:
+        if _musicgen_processor is not None and _musicgen_model is not None:
+            return _musicgen_processor, _musicgen_model
+        try:
+            import torch
+            from transformers import AutoProcessor, MusicgenForConditionalGeneration
+
+            if torch.backends.mps.is_available():
+                device, dtype = "mps", torch.float32
+            elif torch.cuda.is_available():
+                device, dtype = "cuda", torch.float16
+            else:
+                device, dtype = "cpu", torch.float32
+
+            _musicgen_processor = AutoProcessor.from_pretrained("facebook/musicgen-small")
+            _musicgen_model = MusicgenForConditionalGeneration.from_pretrained(
+                "facebook/musicgen-small",
+                torch_dtype=dtype,
+                low_cpu_mem_usage=True,
+            ).to(device)
+            logger.info(f"MusicGen loaded on {device}")
+            return _musicgen_processor, _musicgen_model
+        except ImportError as e:
+            raise HTTPException(status_code=500, detail=f"MusicGen dependencies missing: {e}")
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Failed to load MusicGen model: {e}")
 
 
 @app.on_event("startup")
@@ -1110,77 +1156,54 @@ def generate_music(request: MusicGenerateRequest, user=Depends(get_current_user)
             detail=f"Prompt exceeds maximum length of {MAX_MUSIC_PROMPT_LENGTH} characters."
         )
 
-    with _music_load_lock:
-        try:
-            import torch
-            import scipy.io.wavfile
-            from transformers import AutoProcessor, MusicgenForConditionalGeneration
+    try:
+        import torch
+        import scipy.io.wavfile
 
-            if torch.backends.mps.is_available():
-                device = "mps"
-                dtype = torch.float32
-            elif torch.cuda.is_available():
-                device = "cuda"
-                dtype = torch.float16
-            else:
-                device = "cpu"
-                dtype = torch.float32
+        processor, model = _load_musicgen()
+        device = next(model.parameters()).device.type
 
-            processor = AutoProcessor.from_pretrained("facebook/musicgen-small")
-            model = MusicgenForConditionalGeneration.from_pretrained(
-                "facebook/musicgen-small",
-                torch_dtype=dtype,
-                low_cpu_mem_usage=True,
-            ).to(device)
+        inputs = processor(
+            text=[request.prompt], padding=True, return_tensors="pt"
+        ).to(device)
+        audio_values = model.generate(
+            **inputs, max_new_tokens=int(request.duration * 25.6)
+        )
+        sampling_rate = model.config.audio_encoder.sampling_rate
+        audio_np = audio_values[0, 0].cpu().numpy()
 
-            try:
-                inputs = processor(
-                    text=[request.prompt], padding=True, return_tensors="pt"
-                ).to(device)
-                audio_values = model.generate(
-                    **inputs, max_new_tokens=int(request.duration * 25.6)
-                )
-                sampling_rate = model.config.audio_encoder.sampling_rate
-                audio_np = audio_values[0, 0].cpu().numpy()
-            finally:
-                del model
-                del inputs
-                gc.collect()
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
+        buf = io.BytesIO()
+        scipy.io.wavfile.write(buf, rate=sampling_rate, data=audio_np)
+        audio_bytes = buf.getvalue()
 
-            buf = io.BytesIO()
-            scipy.io.wavfile.write(buf, rate=sampling_rate, data=audio_np)
-            audio_bytes = buf.getvalue()
+        now = datetime.utcnow().isoformat()
+        conn = get_db()
+        conn.execute(
+            "UPDATE users SET generation_count = generation_count + 1 WHERE id = ?", (user["id"],)
+        )
+        cur = conn.execute(
+            "INSERT INTO generations (user_id, filename, model, text_snippet, created_at, audio_data, audio_format)"
+            " VALUES (?,?,?,?,?,?,?)",
+            (user["id"], "", "musicgen-small", request.prompt[:100], now, audio_bytes, "wav"),
+        )
+        gen_id = cur.lastrowid
+        conn.commit()
+        conn.close()
 
-            now = datetime.utcnow().isoformat()
-            conn = get_db()
-            conn.execute(
-                "UPDATE users SET generation_count = generation_count + 1 WHERE id = ?", (user["id"],)
-            )
-            cur = conn.execute(
-                "INSERT INTO generations (user_id, filename, model, text_snippet, created_at, audio_data, audio_format)"
-                " VALUES (?,?,?,?,?,?,?)",
-                (user["id"], "", "musicgen-small", request.prompt[:100], now, audio_bytes, "wav"),
-            )
-            gen_id = cur.lastrowid
-            conn.commit()
-            conn.close()
-
-            logger.info(f"Music generated for user {user['email']}")
-            return Response(
-                content=audio_bytes,
-                media_type="audio/wav",
-                headers={
-                    "Content-Disposition": "inline; filename=music.wav",
-                    "X-Generation-Id": str(gen_id),
-                },
-            )
-        except ImportError as e:
-            raise HTTPException(status_code=500, detail=f"MusicGen dependencies missing: {e}")
-        except Exception as e:
-            logger.error(f"Music generation error: {str(e)}")
-            raise HTTPException(status_code=500, detail=f"Music generation error: {str(e)}")
+        logger.info(f"Music generated for user {user['email']}")
+        return Response(
+            content=audio_bytes,
+            media_type="audio/wav",
+            headers={
+                "Content-Disposition": "inline; filename=music.wav",
+                "X-Generation-Id": str(gen_id),
+            },
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Music generation error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Music generation error: {str(e)}")
 
 
 # ---------------------------------------------------------------------------
@@ -1626,27 +1649,15 @@ def generate_song(request: SongGenerateRequest, user=Depends(get_current_user)):
     vocal_duration = len(vocals_np) / vocal_sr
 
     try:
-        from transformers import AutoProcessor as MusicProcessor, MusicgenForConditionalGeneration
-        dtype = torch.float16 if torch.cuda.is_available() else torch.float32
-        mg_device = "cuda" if torch.cuda.is_available() else "cpu"
-        mg_proc = MusicProcessor.from_pretrained("facebook/musicgen-small")
-        mg_model = MusicgenForConditionalGeneration.from_pretrained(
-            "facebook/musicgen-small", torch_dtype=dtype, low_cpu_mem_usage=True
+        mg_proc, mg_model = _load_musicgen()
+        mg_device = next(mg_model.parameters()).device.type
+        mg_inputs = mg_proc(
+            text=[music_prompt], padding=True, return_tensors="pt"
         ).to(mg_device)
-        try:
-            mg_inputs = mg_proc(
-                text=[music_prompt], padding=True, return_tensors="pt"
-            ).to(mg_device)
-            mg_tokens = max(int(vocal_duration * 25.6), 128)
-            mg_out = mg_model.generate(**mg_inputs, max_new_tokens=mg_tokens)
-            music_np = mg_out[0, 0].cpu().numpy().astype(np.float32)
-            music_sr = mg_model.config.audio_encoder.sampling_rate
-        finally:
-            del mg_model
-            del mg_inputs
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+        mg_tokens = max(int(vocal_duration * 25.6), 128)
+        mg_out = mg_model.generate(**mg_inputs, max_new_tokens=mg_tokens)
+        music_np = mg_out[0, 0].cpu().numpy().astype(np.float32)
+        music_sr = mg_model.config.audio_encoder.sampling_rate
     except Exception as e:
         logger.warning(f"Background music generation failed (vocals only): {e}")
 
