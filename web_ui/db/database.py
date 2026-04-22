@@ -64,6 +64,17 @@ def init_db():
         )
     """
     )
+
+    # Migrate: add audio_data and audio_format columns if not present
+    for col_def in [
+        ("audio_data", "BLOB"),
+        ("audio_format", "TEXT DEFAULT ''"),
+    ]:
+        try:
+            cursor.execute(f"ALTER TABLE generations ADD COLUMN {col_def[0]} {col_def[1]}")
+        except Exception:
+            pass  # column already exists
+
     conn.commit()
     conn.close()
 
