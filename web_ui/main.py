@@ -9,6 +9,7 @@ import secrets
 import re
 import logging
 import threading
+import concurrent.futures
 from pathlib import Path
 from fastapi import FastAPI, HTTPException, Depends, Query, Request, UploadFile, File, Form
 from fastapi.responses import FileResponse, Response
@@ -171,6 +172,83 @@ MAX_TRANSLATION_LENGTH = 5000
 MAX_MUSIC_PROMPT_LENGTH = 1000
 
 init_db()
+
+# ---------------------------------------------------------------------------
+# Async Job Queue
+# ---------------------------------------------------------------------------
+
+# Max 3 heavy AI jobs running concurrently (music, song, voice clone)
+_job_executor = concurrent.futures.ThreadPoolExecutor(max_workers=3, thread_name_prefix="pollux_job")
+
+
+def _create_job(user_id: int, job_type: str) -> str:
+    job_id = secrets.token_hex(8)
+    now = datetime.utcnow().isoformat()
+    conn = get_db()
+    conn.execute(
+        "INSERT INTO jobs (id, user_id, type, status, created_at, updated_at) VALUES (?,?,?,?,?,?)",
+        (job_id, user_id, job_type, "pending", now, now),
+    )
+    conn.commit()
+    conn.close()
+    return job_id
+
+
+def _update_job(job_id: str, status: str, generation_id: int = None, error_message: str = None):
+    now = datetime.utcnow().isoformat()
+    conn = get_db()
+    conn.execute(
+        "UPDATE jobs SET status=?, generation_id=?, error_message=?, updated_at=? WHERE id=?",
+        (status, generation_id, error_message, now, job_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def _save_generation(user_id: int, model_label: str, snippet: str, audio_bytes: bytes, fmt: str) -> int:
+    now = datetime.utcnow().isoformat()
+    conn = get_db()
+    conn.execute("UPDATE users SET generation_count = generation_count + 1 WHERE id = ?", (user_id,))
+    cur = conn.execute(
+        "INSERT INTO generations (user_id, filename, model, text_snippet, created_at, audio_data, audio_format)"
+        " VALUES (?,?,?,?,?,?,?)",
+        (user_id, "", model_label, snippet[:100], now, audio_bytes, fmt),
+    )
+    gen_id = cur.lastrowid
+    conn.commit()
+    conn.close()
+    return gen_id
+
+
+# ---------------------------------------------------------------------------
+# Job timeout limits (seconds)
+# ---------------------------------------------------------------------------
+
+JOB_TIMEOUT_MUSIC       = 60
+JOB_TIMEOUT_SONG        = 90
+JOB_TIMEOUT_VOICE_CLONE = 50
+
+
+def _run_with_timeout(fn, timeout_secs: int, *args, **kwargs):
+    """Run fn(*args, **kwargs) in a worker thread.
+    Raises TimeoutError if it does not complete within timeout_secs.
+    Works on Windows (no signal.alarm available)."""
+    result_box, error_box = [None], [None]
+
+    def _target():
+        try:
+            result_box[0] = fn(*args, **kwargs)
+        except Exception as exc:
+            error_box[0] = exc
+
+    t = threading.Thread(target=_target, daemon=True)
+    t.start()
+    t.join(timeout=timeout_secs)
+    if t.is_alive():
+        raise TimeoutError(f"Operation timed out after {timeout_secs}s")
+    if error_box[0]:
+        raise error_box[0]
+    return result_box[0]
 
 # ---------------------------------------------------------------------------
 # Auth helpers
@@ -783,6 +861,29 @@ def get_stats(user=Depends(get_current_user)):
 
 
 # ---------------------------------------------------------------------------
+# Job polling
+# ---------------------------------------------------------------------------
+
+@app.get("/api/jobs/{job_id}", summary="Poll status of a background generation job")
+def get_job(job_id: str, user=Depends(get_current_user)):
+    conn = get_db()
+    job = conn.execute(
+        "SELECT * FROM jobs WHERE id = ? AND user_id = ?",
+        (job_id, user["id"]),
+    ).fetchone()
+    conn.close()
+
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found.")
+
+    result = dict(job)
+    if job["status"] == "done" and job["generation_id"]:
+        result["audio_url"] = f"/api/audio/{job['generation_id']}"
+        result["download_url"] = f"/api/audio/{job['generation_id']}/download"
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Voices
 # ---------------------------------------------------------------------------
 @app.get("/api/voices", summary="All voices with premium flags")
@@ -844,7 +945,11 @@ def _synthesize_audio(
             "--write-media", str(out_path),
         ]
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        _, stderr = proc.communicate()
+        try:
+            _, stderr = proc.communicate(timeout=30)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            raise HTTPException(status_code=500, detail="edge-tts timed out after 30s")
         if proc.returncode != 0:
             raise HTTPException(status_code=500, detail=f"edge-tts failed: {stderr}")
     else:
@@ -878,7 +983,11 @@ def _synthesize_audio(
                 cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE, text=True,
             )
-            _, stderr = proc.communicate(input=text)
+            try:
+                _, stderr = proc.communicate(input=text, timeout=30)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                raise HTTPException(status_code=500, detail="piper timed out after 30s")
             if proc.returncode != 0:
                 raise HTTPException(status_code=500, detail=f"piper CLI failed: {stderr}")
 
@@ -1134,10 +1243,268 @@ def _load_musicgen():
             raise HTTPException(status_code=500, detail=f"Failed to load MusicGen model: {e}")
 
 
+def _prefetch_xtts_model():
+    try:
+        _load_xtts()
+        logger.info("XTTS v2 pre-warmed at startup")
+    except Exception as e:
+        logger.warning(f"XTTS pre-warm failed (will load on first use): {e}")
+
+
+def _prefetch_whisper_model():
+    try:
+        _load_whisper("base")
+        logger.info("Whisper base pre-warmed at startup")
+    except Exception as e:
+        logger.warning(f"Whisper pre-warm failed (will load on first use): {e}")
+
+
 @app.on_event("startup")
 def startup_event():
+    # Use every CPU core for torch inference
+    try:
+        import torch
+        n = os.cpu_count() or 4
+        torch.set_num_threads(n)
+        torch.set_num_interop_threads(max(2, n // 2))
+        logger.info(f"Torch CPU threads set to {n}")
+    except Exception:
+        pass
+
     threading.Thread(target=_prefetch_music_model, daemon=True).start()
-    threading.Thread(target=_prefetch_bark_model, daemon=True).start()
+    threading.Thread(target=_prefetch_xtts_model, daemon=True).start()
+    threading.Thread(target=_prefetch_whisper_model, daemon=True).start()
+
+
+# ---------------------------------------------------------------------------
+# Background job workers
+# ---------------------------------------------------------------------------
+
+def _job_generate_music(job_id: str, user_id: int, prompt: str, duration: int):
+    _update_job(job_id, "processing")
+    try:
+        import torch, scipy.io.wavfile
+        processor, model = _load_musicgen()
+        device = next(model.parameters()).device.type
+        max_tokens = min(int(duration * 25.6), 205)
+
+        def _generate():
+            with torch.inference_mode():
+                inputs = processor(text=[prompt], padding=True, return_tensors="pt").to(device)
+                return model.generate(**inputs, max_new_tokens=max_tokens)
+
+        audio_values = _run_with_timeout(_generate, JOB_TIMEOUT_MUSIC)
+        sampling_rate = model.config.audio_encoder.sampling_rate
+        audio_np = audio_values[0, 0].cpu().numpy()
+        buf = io.BytesIO()
+        scipy.io.wavfile.write(buf, rate=sampling_rate, data=audio_np)
+        gen_id = _save_generation(user_id, "musicgen-small", prompt, buf.getvalue(), "wav")
+        _update_job(job_id, "done", generation_id=gen_id)
+        logger.info(f"Music job {job_id} done for user {user_id}")
+    except TimeoutError:
+        logger.warning(f"Music job {job_id} timed out after {JOB_TIMEOUT_MUSIC}s")
+        _update_job(job_id, "failed", error_message=f"Generation timed out after {JOB_TIMEOUT_MUSIC}s")
+    except Exception as e:
+        logger.error(f"Music job {job_id} failed: {e}")
+        _update_job(job_id, "failed", error_message=str(e))
+
+
+def _job_generate_song(job_id: str, user_id: int, lyrics: str, voice_preset: str, style: str, quality: str):
+    _update_job(job_id, "processing")
+    tmp_vocal = None
+    deadline = time.time() + JOB_TIMEOUT_SONG
+    try:
+        import torch, numpy as np, scipy.io.wavfile, soundfile as sf
+        from scipy.signal import resample_poly
+        from math import gcd
+
+        # ── Step 1: vocals via edge-tts (fast, 1-3s) ─────────────────────
+        edge_voice = SONG_VOICE_TO_EDGE.get(voice_preset, "en-US-JennyNeural")
+        clean_lyrics = lyrics.strip()
+
+        with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tf:
+            tmp_vocal = tf.name
+
+        cmd = [
+            resolve_bin("edge-tts"),
+            "--voice", edge_voice,
+            "--rate", "-10%",       # slightly slower → more expressive
+            "--pitch", "+2Hz",      # slight lift → more melodic
+            "--text", clean_lyrics,
+            "--write-media", tmp_vocal,
+        ]
+        proc = subprocess.run(cmd, capture_output=True, timeout=30)
+        if proc.returncode != 0:
+            raise RuntimeError(f"edge-tts failed: {proc.stderr.decode()}")
+
+        vocals_np, vocal_sr = sf.read(io.BytesIO(Path(tmp_vocal).read_bytes()))
+        if vocals_np.ndim > 1:
+            vocals_np = vocals_np.mean(axis=1)
+        vocals_np = vocals_np.astype(np.float32)
+
+        # ── Step 2: singing effects via librosa (pitch + reverb) ─────────
+        try:
+            import librosa
+            vocals_np = librosa.effects.pitch_shift(vocals_np, sr=vocal_sr, n_steps=2)
+            # Simple reverb — short delay network
+            wet = np.zeros_like(vocals_np)
+            for delay_ms, decay in [(30, 0.3), (60, 0.2), (100, 0.1)]:
+                d = int(delay_ms * vocal_sr / 1000)
+                if d < len(vocals_np):
+                    padded = np.zeros(len(vocals_np))
+                    padded[d:] = vocals_np[: len(vocals_np) - d] * decay
+                    wet += padded
+            vocals_np = np.clip(vocals_np + wet * 0.4, -1.0, 1.0)
+        except Exception:
+            pass  # effects are optional
+
+        peak = np.max(np.abs(vocals_np))
+        if peak > 0:
+            vocals_np = vocals_np / peak * 0.88
+
+        # ── Step 3: background music via MusicGen (capped at 4s) ─────────
+        music_np = music_sr = None
+        time_left = deadline - time.time()
+        if time_left <= 5:
+            logger.warning(f"Song job {job_id}: skipping MusicGen, only {time_left:.0f}s left")
+        else:
+            style_label = style.replace("_", " ").title()
+            music_prompt = f"{style_label} instrumental background music, no vocals"
+            try:
+                mg_proc, mg_model = _load_musicgen()
+                mg_device = next(mg_model.parameters()).device.type
+
+                def _mg_generate():
+                    with torch.inference_mode():
+                        inp = mg_proc(text=[music_prompt], padding=True, return_tensors="pt").to(mg_device)
+                        return mg_model.generate(**inp, max_new_tokens=102)  # ~4s
+
+                mg_out = _run_with_timeout(_mg_generate, int(time_left - 3))
+                music_np = mg_out[0, 0].cpu().numpy().astype(np.float32)
+                music_sr = mg_model.config.audio_encoder.sampling_rate
+            except (TimeoutError, Exception) as e:
+                logger.warning(f"Background music skipped in song job {job_id}: {e}")
+
+        # ── Step 4: mix vocals + background ──────────────────────────────
+        if music_np is not None and music_sr is not None:
+            if music_sr != vocal_sr:
+                g = gcd(int(music_sr), int(vocal_sr))
+                music_np = resample_poly(music_np, int(vocal_sr) // g, int(music_sr) // g)
+            bg_peak = np.max(np.abs(music_np))
+            if bg_peak > 0:
+                music_np = music_np / bg_peak * 0.35
+            n = len(vocals_np)
+            repeats = -(-n // len(music_np)) if len(music_np) < n else 1
+            music_np = np.tile(music_np, repeats)[:n]
+            mixed = np.clip(vocals_np + music_np, -1.0, 1.0)
+        else:
+            mixed = vocals_np
+
+        audio_int16 = (mixed * 32767).astype(np.int16)
+        buf = io.BytesIO()
+        scipy.io.wavfile.write(buf, rate=vocal_sr, data=audio_int16)
+        gen_id = _save_generation(user_id, f"edge-tts+musicgen:{style}", lyrics, buf.getvalue(), "wav")
+        _update_job(job_id, "done", generation_id=gen_id)
+        logger.info(f"Song job {job_id} done for user {user_id}")
+    except TimeoutError:
+        logger.warning(f"Song job {job_id} timed out after {JOB_TIMEOUT_SONG}s")
+        _update_job(job_id, "failed", error_message=f"Generation timed out after {JOB_TIMEOUT_SONG}s")
+    except Exception as e:
+        logger.error(f"Song job {job_id} failed: {e}")
+        _update_job(job_id, "failed", error_message=str(e))
+    finally:
+        if tmp_vocal:
+            try:
+                Path(tmp_vocal).unlink()
+            except Exception:
+                pass
+
+
+def _xtts_synthesize_chunks(tts, text: str, speaker_wav: str, language: str,
+                            deadline: float = None) -> bytes:
+    """Split text into sentences and synthesise each chunk; concatenate results.
+    Keeps each XTTS call short (~100 chars) which is significantly faster on CPU."""
+    import re, numpy as np, scipy.io.wavfile, soundfile as sf
+
+    # Split on sentence boundaries, keep chunks ≤ 200 chars
+    sentences = re.split(r'(?<=[.!?])\s+', text.strip())
+    chunks, current = [], ""
+    for s in sentences:
+        if len(current) + len(s) <= 200:
+            current = (current + " " + s).strip()
+        else:
+            if current:
+                chunks.append(current)
+            current = s
+    if current:
+        chunks.append(current)
+
+    all_audio = []
+    sr = None
+    for chunk in chunks:
+        if deadline and time.time() > deadline:
+            raise TimeoutError("Voice clone timed out during chunk synthesis")
+        tmp = None
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+                tmp = f.name
+            time_left = max(5, int(deadline - time.time())) if deadline else 40
+            _run_with_timeout(
+                tts.tts_to_file, time_left,
+                text=chunk, speaker_wav=speaker_wav, language=language, file_path=tmp,
+            )
+            data, sr = sf.read(tmp)
+            if data.ndim > 1:
+                data = data.mean(axis=1)
+            all_audio.append(data.astype(np.float32))
+        finally:
+            if tmp:
+                try:
+                    Path(tmp).unlink()
+                except Exception:
+                    pass
+
+    if not all_audio:
+        raise RuntimeError("No audio chunks generated")
+
+    combined = np.concatenate(all_audio)
+    buf = io.BytesIO()
+    scipy.io.wavfile.write(buf, rate=int(sr), data=(combined * 32767).astype(np.int16))
+    return buf.getvalue()
+
+
+def _job_voice_clone(job_id: str, user_id: int, voice_name: str, sample_path: str, text: str, language: str):
+    _update_job(job_id, "processing")
+    deadline = time.time() + JOB_TIMEOUT_VOICE_CLONE
+    try:
+        tts = _load_xtts()
+        audio_bytes = _xtts_synthesize_chunks(tts, text, sample_path, language, deadline=deadline)
+        gen_id = _save_generation(user_id, f"xtts-v2-clone:{voice_name}", text, audio_bytes, "wav")
+        _update_job(job_id, "done", generation_id=gen_id)
+        logger.info(f"Voice clone job {job_id} done for user {user_id}")
+    except TimeoutError:
+        logger.warning(f"Voice clone job {job_id} timed out after {JOB_TIMEOUT_VOICE_CLONE}s")
+        _update_job(job_id, "failed", error_message=f"Generation timed out after {JOB_TIMEOUT_VOICE_CLONE}s")
+    except Exception as e:
+        logger.error(f"Voice clone job {job_id} failed: {e}")
+        _update_job(job_id, "failed", error_message=str(e))
+
+
+def _job_voice_clone_profile(job_id: str, user_id: int, profile_id: int, ref_path: str, text: str, language: str):
+    _update_job(job_id, "processing")
+    deadline = time.time() + JOB_TIMEOUT_VOICE_CLONE
+    try:
+        tts = _load_xtts()
+        audio_bytes = _xtts_synthesize_chunks(tts, text, ref_path, language, deadline=deadline)
+        gen_id = _save_generation(user_id, f"__voice_clone_profile_{profile_id}__", text, audio_bytes, "wav")
+        _update_job(job_id, "done", generation_id=gen_id)
+        logger.info(f"Voice clone profile job {job_id} done for user {user_id}")
+    except TimeoutError:
+        logger.warning(f"Voice clone profile job {job_id} timed out after {JOB_TIMEOUT_VOICE_CLONE}s")
+        _update_job(job_id, "failed", error_message=f"Generation timed out after {JOB_TIMEOUT_VOICE_CLONE}s")
+    except Exception as e:
+        logger.error(f"Voice clone profile job {job_id} failed: {e}")
+        _update_job(job_id, "failed", error_message=str(e))
 
 
 class MusicGenerateRequest(BaseModel):
@@ -1145,65 +1512,17 @@ class MusicGenerateRequest(BaseModel):
     duration: int = 10
 
 
-@app.post("/api/generate_music", summary="Generate music from a text prompt (premium)")
+@app.post("/api/generate_music", summary="Generate music from a text prompt (returns job_id immediately)")
 def generate_music(request: MusicGenerateRequest, user=Depends(get_current_user)):
     if not request.prompt or not request.prompt.strip():
         raise HTTPException(status_code=400, detail="Prompt cannot be empty.")
-
     if len(request.prompt) > MAX_MUSIC_PROMPT_LENGTH:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Prompt exceeds maximum length of {MAX_MUSIC_PROMPT_LENGTH} characters."
-        )
+        raise HTTPException(status_code=400, detail=f"Prompt exceeds {MAX_MUSIC_PROMPT_LENGTH} characters.")
 
-    try:
-        import torch
-        import scipy.io.wavfile
-
-        processor, model = _load_musicgen()
-        device = next(model.parameters()).device.type
-
-        inputs = processor(
-            text=[request.prompt], padding=True, return_tensors="pt"
-        ).to(device)
-        audio_values = model.generate(
-            **inputs, max_new_tokens=int(request.duration * 25.6)
-        )
-        sampling_rate = model.config.audio_encoder.sampling_rate
-        audio_np = audio_values[0, 0].cpu().numpy()
-
-        buf = io.BytesIO()
-        scipy.io.wavfile.write(buf, rate=sampling_rate, data=audio_np)
-        audio_bytes = buf.getvalue()
-
-        now = datetime.utcnow().isoformat()
-        conn = get_db()
-        conn.execute(
-            "UPDATE users SET generation_count = generation_count + 1 WHERE id = ?", (user["id"],)
-        )
-        cur = conn.execute(
-            "INSERT INTO generations (user_id, filename, model, text_snippet, created_at, audio_data, audio_format)"
-            " VALUES (?,?,?,?,?,?,?)",
-            (user["id"], "", "musicgen-small", request.prompt[:100], now, audio_bytes, "wav"),
-        )
-        gen_id = cur.lastrowid
-        conn.commit()
-        conn.close()
-
-        logger.info(f"Music generated for user {user['email']}")
-        return Response(
-            content=audio_bytes,
-            media_type="audio/wav",
-            headers={
-                "Content-Disposition": "inline; filename=music.wav",
-                "X-Generation-Id": str(gen_id),
-            },
-        )
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Music generation error: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Music generation error: {str(e)}")
+    job_id = _create_job(user["id"], "music")
+    _job_executor.submit(_job_generate_music, job_id, user["id"], request.prompt, request.duration)
+    logger.info(f"Music job {job_id} queued for user {user['email']}")
+    return {"job_id": job_id, "status": "pending", "poll_url": f"/api/jobs/{job_id}"}
 
 
 # ---------------------------------------------------------------------------
@@ -1511,10 +1830,29 @@ BARK_VOICE_PRESETS = {
     "fr_singer_1": "v2/fr_speaker_2",
     "de_singer_1": "v2/de_speaker_2",
     "hi_singer_1": "v2/hi_speaker_2",
-    "ar_singer_1": "v2/en_speaker_6",   # Bark doesn't have Arabic presets; fallback
+    "ar_singer_1": "v2/en_speaker_6",
     "tr_singer_1": "v2/tr_speaker_2",
     "ru_singer_1": "v2/ru_speaker_2",
     "pt_singer_1": "v2/pt_speaker_2",
+}
+
+# edge-tts voices used for fast song generation (avoids Bark on CPU)
+SONG_VOICE_TO_EDGE = {
+    "en_singer_1": "en-US-GuyNeural",
+    "en_singer_2": "en-US-DavisNeural",
+    "en_singer_3": "en-US-JennyNeural",
+    "en_singer_4": "en-US-AriaNeural",
+    "en_female_1": "en-US-SaraNeural",
+    "en_female_2": "en-US-NancyNeural",
+    "zh_singer_1": "zh-CN-XiaoxiaoNeural",
+    "es_singer_1": "es-ES-ElviraNeural",
+    "fr_singer_1": "fr-FR-DeniseNeural",
+    "de_singer_1": "de-DE-KatjaNeural",
+    "hi_singer_1": "hi-IN-SwaraNeural",
+    "ar_singer_1": "ar-SA-ZariyahNeural",
+    "tr_singer_1": "tr-TR-EmelNeural",
+    "ru_singer_1": "ru-RU-SvetlanaNeural",
+    "pt_singer_1": "pt-BR-FranciscaNeural",
 }
 
 SONG_STYLE_PROMPTS = {
@@ -1589,131 +1927,26 @@ def _format_song_script(lyrics: str, style: str) -> str:
     return f"{style_tag}\n{body}".strip()
 
 
-@app.post("/api/generate_song", summary="Generate a full AI song with vocals from lyrics (Bark — fully local)")
+@app.post("/api/generate_song", summary="Generate a full AI song with vocals from lyrics (returns job_id immediately)")
 def generate_song(request: SongGenerateRequest, user=Depends(get_current_user)):
-    # Validate
     if not request.lyrics or not request.lyrics.strip():
         raise HTTPException(status_code=400, detail="Lyrics cannot be empty.")
     if len(request.lyrics) > MAX_SONG_LYRICS_LENGTH:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Lyrics exceed maximum length of {MAX_SONG_LYRICS_LENGTH} characters.",
-        )
+        raise HTTPException(status_code=400, detail=f"Lyrics exceed {MAX_SONG_LYRICS_LENGTH} characters.")
     if request.voice_preset not in BARK_VOICE_PRESETS:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Unknown voice preset. Choose from: {list(BARK_VOICE_PRESETS.keys())}",
-        )
+        raise HTTPException(status_code=400, detail=f"Unknown voice preset. Choose from: {list(BARK_VOICE_PRESETS.keys())}")
     if request.style not in SONG_STYLE_PROMPTS:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Unknown style. Choose from: {list(SONG_STYLE_PROMPTS.keys())}",
-        )
+        raise HTTPException(status_code=400, detail=f"Unknown style. Choose from: {list(SONG_STYLE_PROMPTS.keys())}")
     if request.quality not in {"small", "large"}:
         raise HTTPException(status_code=400, detail="quality must be 'small' or 'large'.")
 
-    # Load model
-    import torch
-    import numpy as np
-    import scipy.io.wavfile
-    from scipy.signal import resample_poly
-    from math import gcd
-
-    processor, bark_model = _load_bark(request.quality)
-    script = _format_song_script(request.lyrics, request.style)
-    voice_preset = BARK_VOICE_PRESETS[request.voice_preset]
-
-    # ── Step 1: generate vocals with Bark ────────────────────────────────
-    try:
-        inputs = processor(
-            text=[script], voice_preset=voice_preset, return_tensors="pt"
-        ).to(_bark_device)
-        with torch.no_grad():
-            audio_array = bark_model.generate(**inputs, do_sample=True)
-        vocals_np = audio_array.cpu().numpy().squeeze().astype(np.float32)
-        vocal_sr = bark_model.generation_config.sample_rate
-    except Exception as e:
-        logger.error(f"Bark vocals error: {e}")
-        raise HTTPException(status_code=500, detail=f"Vocal generation failed: {e}")
-
-    # Normalise vocals
-    peak = np.max(np.abs(vocals_np))
-    if peak > 0:
-        vocals_np = vocals_np / peak * 0.88
-
-    # ── Step 2: generate background music with MusicGen ──────────────────
-    music_np = None
-    music_sr = None
-    style_label = request.style if request.style != "none" else "ambient background music"
-    music_prompt = f"{style_label} instrumental background music, no vocals"
-    vocal_duration = len(vocals_np) / vocal_sr
-
-    try:
-        mg_proc, mg_model = _load_musicgen()
-        mg_device = next(mg_model.parameters()).device.type
-        mg_inputs = mg_proc(
-            text=[music_prompt], padding=True, return_tensors="pt"
-        ).to(mg_device)
-        mg_tokens = max(int(vocal_duration * 25.6), 128)
-        mg_out = mg_model.generate(**mg_inputs, max_new_tokens=mg_tokens)
-        music_np = mg_out[0, 0].cpu().numpy().astype(np.float32)
-        music_sr = mg_model.config.audio_encoder.sampling_rate
-    except Exception as e:
-        logger.warning(f"Background music generation failed (vocals only): {e}")
-
-    # ── Step 3: mix vocals + background ──────────────────────────────────
-    if music_np is not None and music_sr is not None:
-        # Resample music to vocal sample rate if needed
-        if music_sr != vocal_sr:
-            g = gcd(int(music_sr), int(vocal_sr))
-            music_np = resample_poly(music_np, int(vocal_sr) // g, int(music_sr) // g).astype(np.float32)
-
-        # Normalise background
-        bg_peak = np.max(np.abs(music_np))
-        if bg_peak > 0:
-            music_np = music_np / bg_peak * 0.38   # background at 38% level
-
-        # Trim or pad background to match vocal length
-        n = len(vocals_np)
-        if len(music_np) >= n:
-            music_np = music_np[:n]
-        else:
-            repeats = -(-n // len(music_np))   # ceiling div
-            music_np = np.tile(music_np, repeats)[:n]
-
-        mixed = np.clip(vocals_np + music_np, -1.0, 1.0)
-    else:
-        mixed = vocals_np
-
-    # Convert to int16 and stream back
-    audio_int16 = (mixed * 32767).astype(np.int16)
-    buf = io.BytesIO()
-    scipy.io.wavfile.write(buf, rate=vocal_sr, data=audio_int16)
-    audio_bytes = buf.getvalue()
-
-    now = datetime.utcnow().isoformat()
-    conn = get_db()
-    conn.execute(
-        "UPDATE users SET generation_count = generation_count + 1 WHERE id = ?", (user["id"],)
+    job_id = _create_job(user["id"], "song")
+    _job_executor.submit(
+        _job_generate_song, job_id, user["id"],
+        request.lyrics, request.voice_preset, request.style, request.quality,
     )
-    cur = conn.execute(
-        "INSERT INTO generations (user_id, filename, model, text_snippet, created_at, audio_data, audio_format)"
-        " VALUES (?,?,?,?,?,?,?)",
-        (user["id"], "", f"bark-{request.quality}+musicgen", request.lyrics[:100], now, audio_bytes, "wav"),
-    )
-    gen_id = cur.lastrowid
-    conn.commit()
-    conn.close()
-
-    logger.info(f"Song generated for user {user['email']} (vocals + background)")
-    return Response(
-        content=audio_bytes,
-        media_type="audio/wav",
-        headers={
-            "Content-Disposition": "inline; filename=song.wav",
-            "X-Generation-Id": str(gen_id),
-        },
-    )
+    logger.info(f"Song job {job_id} queued for user {user['email']}")
+    return {"job_id": job_id, "status": "pending", "poll_url": f"/api/jobs/{job_id}"}
 
 
 @app.get("/api/song/voices", summary="List available Bark voice presets for song generation")
@@ -1962,58 +2195,18 @@ def generate_with_cloned_voice(
     if not sample_path.exists():
         raise HTTPException(status_code=404, detail="Voice sample file missing.")
 
-    # Load XTTS model (lazy)
-    tts = _load_xtts()
-
-    # Synthesise to temp file, read bytes, then discard file
-    tmp_out_path = None
-    try:
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_out:
-            tmp_out_path = tmp_out.name
-        tts.tts_to_file(
-            text=request.text.strip(),
-            speaker_wav=str(sample_path),
-            language=lang,
-            file_path=tmp_out_path,
-        )
-        audio_bytes = Path(tmp_out_path).read_bytes()
-    except Exception as e:
-        logger.error(f"XTTS generation error: {e}")
-        raise HTTPException(status_code=500, detail=f"Voice cloning generation failed: {e}")
-    finally:
-        if tmp_out_path:
-            try:
-                Path(tmp_out_path).unlink()
-            except Exception:
-                pass
-
-    now = datetime.utcnow().isoformat()
-    conn = get_db()
-    conn.execute(
-        "UPDATE users SET generation_count = generation_count + 1 WHERE id = ?",
-        (user["id"],),
+    job_id = _create_job(user["id"], "voice_clone")
+    _job_executor.submit(
+        _job_voice_clone, job_id, user["id"],
+        row["name"], str(sample_path), request.text.strip(), lang,
     )
-    cur = conn.execute(
-        "INSERT INTO generations (user_id, filename, model, text_snippet, created_at, audio_data, audio_format)"
-        " VALUES (?,?,?,?,?,?,?)",
-        (user["id"], "", f"xtts-v2-clone:{row['name']}", request.text[:100], now, audio_bytes, "wav"),
-    )
-    generation_id = cur.lastrowid
-    conn.commit()
-    updated = conn.execute("SELECT * FROM users WHERE id = ?", (user["id"],)).fetchone()
-    conn.close()
-
-    logger.info(f"Cloned voice TTS for user {user['email']}: voice='{row['name']}', gen={generation_id}")
-
+    logger.info(f"Voice clone job {job_id} queued for user {user['email']}: voice='{row['name']}'")
     return {
-        "success": True,
-        "generation_id": generation_id,
-        "audio_url": f"/api/audio/{generation_id}",
-        "download_url": f"/api/audio/{generation_id}/download",
+        "job_id": job_id,
+        "status": "pending",
+        "poll_url": f"/api/jobs/{job_id}",
         "voice_name": row["name"],
         "language": lang,
-        "credits": updated["credits"] if not updated["is_premium"] else "Unlimited",
-        "generations_remaining": user_remaining(updated),
     }
 
 
@@ -2314,54 +2507,13 @@ def voice_clone_from_profile(
     if not ref_path.exists():
         raise HTTPException(status_code=404, detail="Reference audio file missing from server.")
 
-    # Synthesise to temp file, stream back
-    tmp_out_path = None
-    try:
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_out:
-            tmp_out_path = tmp_out.name
-        tts = _load_xtts()
-        tts.tts_to_file(
-            text=request.text.strip(),
-            speaker_wav=str(ref_path),
-            language=language,
-            file_path=tmp_out_path,
-        )
-        audio_bytes = Path(tmp_out_path).read_bytes()
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Voice clone from profile error for {user['email']}: {e}")
-        raise HTTPException(status_code=500, detail=f"Voice cloning failed: {e}")
-    finally:
-        if tmp_out_path:
-            try:
-                Path(tmp_out_path).unlink()
-            except Exception:
-                pass
-
-    now = datetime.utcnow().isoformat()
-    conn = get_db()
-    conn.execute(
-        "UPDATE users SET generation_count = generation_count + 1 WHERE id = ?", (user["id"],)
+    job_id = _create_job(user["id"], "voice_clone_profile")
+    _job_executor.submit(
+        _job_voice_clone_profile, job_id, user["id"],
+        profile_id, str(ref_path), request.text.strip(), language,
     )
-    cur = conn.execute(
-        "INSERT INTO generations (user_id, filename, model, text_snippet, created_at, audio_data, audio_format)"
-        " VALUES (?,?,?,?,?,?,?)",
-        (user["id"], "", f"__voice_clone_profile_{profile_id}__", request.text[:100], now, audio_bytes, "wav"),
-    )
-    gen_id = cur.lastrowid
-    conn.commit()
-    conn.close()
-
-    logger.info(f"Voice clone from profile {profile_id} for {user['email']}")
-    return Response(
-        content=audio_bytes,
-        media_type="audio/wav",
-        headers={
-            "Content-Disposition": "inline; filename=clone.wav",
-            "X-Generation-Id": str(gen_id),
-        },
-    )
+    logger.info(f"Voice clone profile job {job_id} queued for user {user['email']}: profile={profile_id}")
+    return {"job_id": job_id, "status": "pending", "poll_url": f"/api/jobs/{job_id}"}
 
 
 # ── list supported languages ──

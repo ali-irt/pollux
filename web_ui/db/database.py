@@ -65,6 +65,22 @@ def init_db():
     """
     )
 
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS jobs (
+            id TEXT PRIMARY KEY,
+            user_id INTEGER NOT NULL,
+            type TEXT NOT NULL,
+            status TEXT DEFAULT 'pending',
+            generation_id INTEGER,
+            error_message TEXT,
+            created_at TEXT,
+            updated_at TEXT,
+            FOREIGN KEY (user_id) REFERENCES users (id)
+        )
+    """
+    )
+
     # Migrate: add audio_data and audio_format columns if not present
     for col_def in [
         ("audio_data", "BLOB"),
