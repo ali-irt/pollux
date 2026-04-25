@@ -1,23 +1,75 @@
-FROM python:3.12-slim
+# Production Dockerfile — non-root user, health check, optimised layers
+FROM python:3.11-slim AS builder
 
-ENV PYTHONDONTWRITEBYTECODE=1
-ENV PYTHONUNBUFFERED=1
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+# Build-time system deps (compilers for C-extension packages)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    git \
+    curl \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+
+COPY web_ui/requirements-prod.txt ./
+RUN pip install --no-cache-dir --prefix=/install -r requirements-prod.txt
+
+# ---------------------------------------------------------------------------
+
+FROM python:3.11-slim AS runtime
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    # Tells Python where the installed packages live
+    PYTHONPATH=/usr/local/lib/python3.11/site-packages
+
+# Runtime-only system libraries (no compilers)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libsndfile1 \
+    libgomp1 \
+    ffmpeg \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy installed Python packages and binaries from builder
+COPY --from=builder /install/lib /usr/local/lib
+COPY --from=builder /install/bin /usr/local/bin
+
+# Dedicated non-root user
+RUN groupadd -r pollux && useradd -r -g pollux -d /home/pollux -m pollux
 
 WORKDIR /app
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential cmake git curl ca-certificates pkg-config \
-    && rm -rf /var/lib/apt/lists/*
+# Copy application code only (venv, db, outputs excluded via .dockerignore)
+COPY web_ui/ ./web_ui/
 
-COPY . /app
+# Pre-create runtime directories with correct ownership
+RUN mkdir -p \
+        web_ui/outputs \
+        web_ui/voice_samples \
+        web_ui/cloned_voices \
+        web_ui/db \
+    && chown -R pollux:pollux /app
 
+USER pollux
 
-RUN pip install --no-cache-dir "pip<24.1"
-
-RUN pip install --no-cache-dir -r /app/web_ui/requirements-prod.txt
+# HuggingFace model cache lives in the user's home so it can be volume-mounted
+ENV HF_HOME=/home/pollux/.cache/huggingface
 
 WORKDIR /app/web_ui
 
-EXPOSE 8000
+EXPOSE 8004
 
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+HEALTHCHECK --interval=30s --timeout=10s --start-period=120s --retries=3 \
+    CMD curl -sf http://localhost:8004/api/endpoints > /dev/null || exit 1
+
+CMD ["uvicorn", "main:app", \
+     "--host", "0.0.0.0", \
+     "--port", "8004", \
+     "--proxy-headers", \
+     "--forwarded-allow-ips", "*"]

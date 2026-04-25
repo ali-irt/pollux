@@ -1,15 +1,40 @@
 services:
-  pollux:
+  api:
     build:
       context: .
       dockerfile: Dockerfile.prod
-    container_name: pollux
+    image: pollux-api:latest
+    container_name: pollux-api
     restart: unless-stopped
     env_file:
-      - .env
+      - web_ui/.env
     ports:
-      - "127.0.0.1:8000:8000"
+      - "127.0.0.1:8004:8004"
     volumes:
-      - ./web_ui/outputs:/app/web_ui/outputs
-      - ./web_ui/models:/app/web_ui/models
-      - ./web_ui/pollux.db:/app/web_ui/pollux.db
+      # Persistent data — survives container restarts and rebuilds
+      - pollux-db:/app/web_ui/db
+      - pollux-outputs:/app/web_ui/outputs
+      - pollux-models:/app/web_ui/models
+      - pollux-voice-samples:/app/web_ui/voice_samples
+      - pollux-cloned-voices:/app/web_ui/cloned_voices
+      # HuggingFace model cache — avoids re-downloading large AI models
+      - hf-cache:/home/pollux/.cache/huggingface
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8004/api/endpoints"]
+      interval: 30s
+      timeout: 10s
+      start_period: 120s
+      retries: 3
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  pollux-db:
+  pollux-outputs:
+  pollux-models:
+  pollux-voice-samples:
+  pollux-cloned-voices:
+  hf-cache:

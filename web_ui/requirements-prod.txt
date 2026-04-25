@@ -1,3 +1,4 @@
+bcrypt==4.3.0
 absl-py==2.4.0
 aiohappyeyeballs==2.6.1
 aiohttp==3.13.5

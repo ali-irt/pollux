@@ -1,0 +1,16 @@
+.git
+.claude
+env/
+venv/
+.venv/
+**/__pycache__
+**/*.pyc
+**/*.pyo
+*.log
+web_ui/.env
+web_ui/db/pollux.db
+web_ui/db/pollux.db-wal
+web_ui/db/pollux.db-shm
+web_ui/outputs/
+web_ui/voice_samples/
+web_ui/cloned_voices/

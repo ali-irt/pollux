@@ -1,52 +1,33 @@
-FROM debian:bullseye as build
-ARG TARGETARCH
-ARG TARGETVARIANT
+# Development Dockerfile — hot reload, debug logging
+# Usage: docker compose -f docker-compose.dev.yml up
+FROM python:3.11-slim
 
-ENV LANG C.UTF-8
-ENV DEBIAN_FRONTEND=noninteractive
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
 
-RUN apt-get update && \
-    apt-get install --yes --no-install-recommends \
-        build-essential cmake ca-certificates curl pkg-config git
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    git \
+    curl \
+    ca-certificates \
+    libsndfile1 \
+    libgomp1 \
+    ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
 
-WORKDIR /build
+WORKDIR /app
 
-COPY ./ ./
-RUN cmake -Bbuild -DCMAKE_INSTALL_PREFIX=install
-RUN cmake --build build --config Release
-RUN cmake --install build
+COPY web_ui/requirements.txt ./
+RUN pip install --no-cache-dir -r requirements.txt
 
-# Do a test run
-RUN ./build/piper --help
+COPY web_ui/ ./web_ui/
 
-# Build .tar.gz to keep symlinks
-WORKDIR /dist
-RUN mkdir -p piper && \
-    cp -dR /build/install/* ./piper/ && \
-    tar -czf "piper_${TARGETARCH}${TARGETVARIANT}.tar.gz" piper/
+RUN mkdir -p web_ui/outputs web_ui/voice_samples web_ui/cloned_voices web_ui/db
 
-# -----------------------------------------------------------------------------
+WORKDIR /app/web_ui
 
-# FROM debian:bullseye as test
-# ARG TARGETARCH
-# ARG TARGETVARIANT
+EXPOSE 8004
 
-# WORKDIR /test
-
-# COPY local/en-us/lessac/low/en-us-lessac-low.onnx \
-#      local/en-us/lessac/low/en-us-lessac-low.onnx.json ./
-
-# # Run Piper on a test sentence and verify that the WAV file isn't empty
-# COPY --from=build /dist/piper_*.tar.gz ./
-# RUN tar -xzf piper*.tar.gz
-# RUN echo 'This is a test.' | ./piper/piper -m en-us-lessac-low.onnx -f test.wav
-# RUN if [ ! -f test.wav ]; then exit 1; fi
-# RUN size="$(wc -c < test.wav)"; \
-#     if [ "${size}" -lt "1000" ]; then echo "File size is ${size} bytes"; exit 1; fi
-
-# -----------------------------------------------------------------------------
-
-FROM scratch
-
-# COPY --from=test /test/piper_*.tar.gz /test/test.wav ./
-COPY --from=build /dist/piper_*.tar.gz ./
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8004", "--reload"]
