@@ -939,8 +939,8 @@ def _synthesize_audio(
         cmd = [
             resolve_bin("edge-tts"),
             "--voice", model_info.get("edge_voice", "ur-PK-UzmaNeural"),
-            "--pitch", pitch_str,
-            "--rate", rate_str,
+            f"--pitch={pitch_str}",
+            f"--rate={rate_str}",
             "--text", text,
             "--write-media", str(out_path),
         ]
@@ -1079,7 +1079,9 @@ def get_history(
         (user["id"],),
     ).fetchone()["cnt"]
     rows = conn.execute(
-        "SELECT * FROM generations WHERE user_id = ? AND model NOT IN ('__batch_zip__') ORDER BY created_at DESC LIMIT ? OFFSET ?",
+        "SELECT id, user_id, filename, model, text_snippet, created_at, audio_format"
+        " FROM generations WHERE user_id = ? AND model NOT IN ('__batch_zip__')"
+        " ORDER BY created_at DESC LIMIT ? OFFSET ?",
         (user["id"], per_page, offset),
     ).fetchall()
     conn.close()
@@ -1328,8 +1330,8 @@ def _job_generate_song(job_id: str, user_id: int, lyrics: str, voice_preset: str
         cmd = [
             resolve_bin("edge-tts"),
             "--voice", edge_voice,
-            "--rate", "-10%",       # slightly slower → more expressive
-            "--pitch", "+2Hz",      # slight lift → more melodic
+            "--rate=-10%",          # slightly slower → more expressive
+            "--pitch=+2Hz",         # slight lift → more melodic
             "--text", clean_lyrics,
             "--write-media", tmp_vocal,
         ]
