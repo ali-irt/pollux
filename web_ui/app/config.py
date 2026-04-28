@@ -57,7 +57,7 @@ BASE_URL = os.environ.get("BASE_URL", "http://localhost:8000")
 
 INITIAL_FREE_CREDITS = 50
 CREDITS_PER_GENERATION = 5
-PREMIUM_QUALITIES = {"high", "medium"}
+PREMIUM_QUALITIES = set()  # all voices free
 
 # ---------------------------------------------------------------------------
 # Input length limits
@@ -74,9 +74,15 @@ MAX_MUSIC_PROMPT_LENGTH = 1000
 # Job timeout limits (seconds)
 # ---------------------------------------------------------------------------
 
+
 JOB_TIMEOUT_MUSIC = 360
 JOB_TIMEOUT_SONG = 360
 JOB_TIMEOUT_VOICE_CLONE = 550
+=======
+JOB_TIMEOUT_MUSIC = 300
+JOB_TIMEOUT_SONG = 360
+JOB_TIMEOUT_VOICE_CLONE = 240
+
 
 # ---------------------------------------------------------------------------
 # CORS

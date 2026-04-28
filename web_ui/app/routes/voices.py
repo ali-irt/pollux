@@ -34,11 +34,10 @@ def is_premium_voice(model_info: dict) -> bool:
     return model_info.get("quality", "") in PREMIUM_QUALITIES
 
 
-def annotate_voices(voices: dict, is_premium_user: bool) -> dict:
+def annotate_voices(voices: dict, is_premium_user: bool = True) -> dict:
     for info in voices.values():
-        premium = is_premium_voice(info)
-        info["is_premium"] = premium
-        info["locked"] = premium and not is_premium_user
+        info["is_premium"] = False
+        info["locked"] = False
     return voices
 
 
