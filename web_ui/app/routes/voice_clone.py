@@ -26,7 +26,6 @@ from app.config import (
     CLONE_MAX_PER_USER,
     MAX_REFERENCE_AUDIO_SIZE,
     MAX_VOICE_PROFILE_NAME_LENGTH,
-    MAX_VOICE_PROFILES_FREE,
     MAX_VOICE_PROFILES_PREMIUM,
     VOICE_CLONE_ALLOWED_EXT,
     XTTS_LANGUAGES,
@@ -177,7 +176,7 @@ def list_voice_profiles(user=Depends(get_current_user)):
         (user["id"],),
     ).fetchall()
     conn.close()
-    max_profiles = MAX_VOICE_PROFILES_PREMIUM if user["is_premium"] else MAX_VOICE_PROFILES_FREE
+    max_profiles = MAX_VOICE_PROFILES_PREMIUM
     return {
         "profiles": [dict(r) for r in rows],
         "count": len(rows),
@@ -398,7 +397,7 @@ async def save_voice_profile(
     reference_audio: UploadFile = File(..., description="Reference audio file"),
     user=Depends(get_current_user),
 ):
-    max_profiles = MAX_VOICE_PROFILES_PREMIUM if user["is_premium"] else MAX_VOICE_PROFILES_FREE
+    max_profiles = MAX_VOICE_PROFILES_PREMIUM
     conn = get_db()
     existing_count = conn.execute(
         "SELECT COUNT(*) as cnt FROM cloned_voices WHERE user_id = ?", (user["id"],)
@@ -406,12 +405,10 @@ async def save_voice_profile(
     conn.close()
 
     if existing_count >= max_profiles:
-        detail = (
-            f"Voice profile limit reached ({max_profiles}). "
-            + ("Delete an existing profile to add a new one." if user["is_premium"]
-               else "Upgrade to premium for more profiles.")
+        raise HTTPException(
+            status_code=403,
+            detail=f"Voice profile limit reached ({max_profiles}). Delete an existing profile to add a new one.",
         )
-        raise HTTPException(status_code=403, detail=detail)
 
     name = name.strip()
     if not name:

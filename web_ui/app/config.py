@@ -57,7 +57,7 @@ BASE_URL = os.environ.get("BASE_URL", "http://localhost:8000")
 
 INITIAL_FREE_CREDITS = 50
 CREDITS_PER_GENERATION = 5
-PREMIUM_QUALITIES = {"high", "medium"}
+PREMIUM_QUALITIES = set()  # all voices free
 
 # ---------------------------------------------------------------------------
 # Input length limits
