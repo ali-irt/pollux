@@ -74,9 +74,9 @@ MAX_MUSIC_PROMPT_LENGTH = 1000
 # Job timeout limits (seconds)
 # ---------------------------------------------------------------------------
 
-JOB_TIMEOUT_MUSIC = 60
-JOB_TIMEOUT_SONG = 90
-JOB_TIMEOUT_VOICE_CLONE = 50
+JOB_TIMEOUT_MUSIC = 360
+JOB_TIMEOUT_SONG = 360
+JOB_TIMEOUT_VOICE_CLONE = 550
 
 # ---------------------------------------------------------------------------
 # CORS
