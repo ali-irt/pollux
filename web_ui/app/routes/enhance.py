@@ -3,6 +3,7 @@ app/routes/enhance.py
 Local audio enhancement endpoint (normalize, fade, reverb, pitch, speed).
 Uses librosa + scipy — no external API calls.
 """
+import asyncio
 import io
 import logging
 import tempfile
@@ -57,92 +58,68 @@ async def enhance_audio(
     pitch_steps = max(-6, min(6, pitch_steps))
     speed_factor = max(0.5, min(2.0, speed_factor))
 
-    tmp_in_path = None
-    try:
-        with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp:
-            tmp.write(content)
-            tmp_in_path = tmp.name
+    def _process(raw: bytes) -> bytes:
+        tmp_in_path = None
         try:
-            y, sr = librosa.load(tmp_in_path, sr=None, mono=False)
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Failed to load audio: {e}")
-    finally:
-        if tmp_in_path:
+            with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp:
+                tmp.write(raw)
+                tmp_in_path = tmp.name
             try:
-                Path(tmp_in_path).unlink()
-            except Exception:
-                pass
+                y, sr = librosa.load(tmp_in_path, sr=None, mono=False)
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=f"Failed to load audio: {e}")
+        finally:
+            if tmp_in_path:
+                try:
+                    Path(tmp_in_path).unlink()
+                except Exception:
+                    pass
 
-    # Ensure shape is (channels, samples) for multi-channel support
-    if y.ndim == 1:
-        y = y[np.newaxis, :]
+        if y.ndim == 1:
+            y = y[np.newaxis, :]
 
-    try:
         processed_channels = []
         for ch in range(y.shape[0]):
             audio = y[ch].copy()
-
-            # 1. Time-stretch (pitch-preserving speed change)
             if abs(speed_factor - 1.0) > 0.01:
                 audio = librosa.effects.time_stretch(audio, rate=speed_factor)
-
-            # 2. Pitch shift
             if pitch_steps != 0:
                 audio = librosa.effects.pitch_shift(audio, sr=sr, n_steps=pitch_steps)
-
-            # 3. Fade in
             if fade_in > 0.0:
-                fade_samples = int(fade_in * sr)
-                fade_samples = min(fade_samples, len(audio))
-                ramp = np.linspace(0.0, 1.0, fade_samples)
-                audio[:fade_samples] *= ramp
-
-            # 4. Fade out
+                n = min(int(fade_in * sr), len(audio))
+                audio[:n] *= np.linspace(0.0, 1.0, n)
             if fade_out > 0.0:
-                fade_samples = int(fade_out * sr)
-                fade_samples = min(fade_samples, len(audio))
-                ramp = np.linspace(1.0, 0.0, fade_samples)
-                audio[-fade_samples:] *= ramp
-
-            # 5. Simple algorithmic reverb (comb-filter delay network)
+                n = min(int(fade_out * sr), len(audio))
+                audio[-n:] *= np.linspace(1.0, 0.0, n)
             if reverb_amount > 0.0:
-                delays_ms = [29, 37, 43, 53]  # prime delay lengths (ms)
                 wet = np.zeros_like(audio)
-                for d_ms in delays_ms:
-                    delay_samples = int(d_ms * sr / 1000)
-                    if delay_samples < len(audio):
-                        decay = reverb_amount * 0.5
+                for d_ms in [29, 37, 43, 53]:
+                    d = int(d_ms * sr / 1000)
+                    if d < len(audio):
                         padded = np.zeros(len(audio))
-                        padded[delay_samples:] = audio[: len(audio) - delay_samples] * decay
+                        padded[d:] = audio[: len(audio) - d] * (reverb_amount * 0.5)
                         wet += padded
                 audio = audio + wet * reverb_amount
-
             processed_channels.append(audio)
 
         result = np.stack(processed_channels, axis=0)
-
-        # 6. Normalize
         if normalize:
             peak = np.max(np.abs(result))
             if peak > 0:
                 result = result / peak * 0.95
+        result = result[0] if result.shape[0] == 1 else result.T
 
-        # Squeeze mono back to 1D
-        if result.shape[0] == 1:
-            result = result[0]
-        else:
-            result = result.T  # (N, channels) for soundfile
+        buf = io.BytesIO()
+        sf.write(buf, result, sr, format="WAV")
+        return buf.getvalue()
 
+    try:
+        audio_bytes = await asyncio.to_thread(_process, content)
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Enhancement processing failed: {e}")
 
-    buf = io.BytesIO()
-    try:
-        sf.write(buf, result, sr, format="WAV")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to encode enhanced audio: {e}")
-
-    audio_bytes = buf.getvalue()
     now = datetime.utcnow().isoformat()
     conn = get_db()
     cur = conn.execute(
