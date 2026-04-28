@@ -92,42 +92,6 @@ app.add_middleware(
 # ---------------------------------------------------------------------------
 # Security headers middleware
 # ---------------------------------------------------------------------------
-
-
-@app.middleware("http")
-async def add_security_headers(request: Request, call_next):
-    response = await call_next(request)
-
-    response.headers["X-Content-Type-Options"] = "nosniff"
-    response.headers["X-Frame-Options"] = "DENY"
-    response.headers["X-XSS-Protection"] = "1; mode=block"
-
-    if request.url.scheme == "https":
-        response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains; preload"
-
-    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
-
-    if os.environ.get("ENVIRONMENT") == "development":
-        response.headers["Content-Security-Policy"] = (
-            "default-src 'self' data: blob:; "
-            "script-src 'self' 'unsafe-inline' 'unsafe-eval' https://cdn.jsdelivr.net; "
-            "style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; "
-            "img-src 'self' data: https://fastapi.tiangolo.com; "
-            "font-src 'self' https://cdn.jsdelivr.net;"
-        )
-    else:
-        response.headers["Content-Security-Policy"] = (
-            "default-src 'none'; "
-            "script-src 'none'; "
-            "style-src 'none'; "
-            "img-src 'none'; "
-            "connect-src 'self'; "
-            "frame-ancestors 'none';"
-        )
-    return response
-
-
-# ---------------------------------------------------------------------------
 # Request logging middleware
 # ---------------------------------------------------------------------------
 
