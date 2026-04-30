@@ -62,6 +62,21 @@ def get_job(job_id: str, user=Depends(get_current_user)):
     return result
 
 
+@router.get("/api/models", summary="List all AI models with display names and icons", tags=["Info"])
+def list_models():
+    return {"models": [
+        {"id": "edge-tts",          "name": "Edge TTS",         "icon": "🗣️",  "category": "tts",          "speed": "fast",   "local": False, "description": "Microsoft Edge neural TTS — 400+ voices, 50+ languages"},
+        {"id": "piper",             "name": "Piper TTS",        "icon": "🎙️",  "category": "tts",          "speed": "fast",   "local": True,  "description": "Fast offline neural TTS"},
+        {"id": "bark",              "name": "Bark",             "icon": "🐶",  "category": "tts",          "speed": "slow",   "local": True,  "description": "Suno Bark — expressive AI speech with emotion & laughter"},
+        {"id": "xtts-v2",           "name": "Voice Clone",      "icon": "🎭",  "category": "voice_clone",  "speed": "medium", "local": True,  "description": "Coqui XTTS v2 — clone any voice in 17 languages"},
+        {"id": "musicgen",          "name": "Music Generator",  "icon": "🎵",  "category": "music",        "speed": "slow",   "local": True,  "description": "Meta MusicGen — create background music from a text prompt"},
+        {"id": "musicgen+vocals",   "name": "AI Song",          "icon": "🎤",  "category": "music",        "speed": "slow",   "local": True,  "description": "Lyrics → vocals (Edge TTS) + background music (MusicGen)"},
+        {"id": "whisper",           "name": "Whisper",          "icon": "👂",  "category": "transcribe",   "speed": "medium", "local": True,  "description": "OpenAI Whisper — speech-to-text in 99 languages"},
+        {"id": "deep-translator",   "name": "Translator",       "icon": "🌐",  "category": "translate",    "speed": "fast",   "local": False, "description": "Text translation via Google Translate"},
+        {"id": "librosa",           "name": "Audio Enhancer",   "icon": "✨",  "category": "enhance",      "speed": "fast",   "local": True,  "description": "Normalize, fade, reverb, pitch shift, speed"},
+    ]}
+
+
 @router.get("/api/endpoints", summary="List all API endpoints (mobile dev reference)", tags=["Info"])
 def list_endpoints():
     """Returns base URL and a structured map of every endpoint — use this to configure your mobile API client."""
@@ -102,17 +117,17 @@ def list_endpoints():
         # ── Audio enhancement ─────────────────────────────────────────────────
         {"group": "Audio",  "method": "POST", "path": "/api/enhance_audio",        "auth": True, "description": "Apply effects (normalize, fade, reverb, pitch, speed)"},
         {"group": "Audio",  "method": "POST", "path": "/api/transcribe",           "auth": True, "description": "Speech-to-text via local Whisper"},
-        # ── Music ─────────────────────────────────────────────────────────────
-        {"group": "Music",  "method": "POST", "path": "/api/generate_music",       "auth": True, "description": "Generate music locally (MusicGen)"},
-        {"group": "Music",  "method": "POST", "path": "/api/generate_music_fal",   "auth": True, "description": "Generate music via FAL.AI stable-audio"},
-        # ── Song generation ───────────────────────────────────────────────────
-        {"group": "Song",   "method": "POST", "path": "/api/generate_song",        "auth": True, "description": "Generate AI song with vocals (Bark, fully local)"},
-        {"group": "Song",   "method": "GET",  "path": "/api/song/voices",          "auth": True, "description": "List Bark voice presets"},
+        # ── Music & Song ──────────────────────────────────────────────────────
+        {"group": "Music",  "method": "POST", "path": "/api/generate_music",       "auth": True, "description": "🎵 Instrumental: prompt+duration  |  🎤 Song: add lyrics+voice_preset+style"},
+        {"group": "Music",  "method": "GET",  "path": "/api/music/options",        "auth": True, "description": "List voice presets, styles, and modes for music/song generation"},
+        {"group": "Music",  "method": "POST", "path": "/api/generate_song",        "auth": True, "description": "Alias for /api/generate_music with lyrics (backwards compat)"},
+        {"group": "Music",  "method": "POST", "path": "/api/generate_music_fal",   "auth": True, "description": "FAL.AI music generation (not yet implemented)"},
         # ── Translation ───────────────────────────────────────────────────────
         {"group": "Translation", "method": "POST", "path": "/api/translate",       "auth": True, "description": "Translate text to target language"},
         {"group": "Translation", "method": "GET",  "path": "/api/languages",       "auth": False, "description": "List all supported translation languages"},
-        # ── Stats ─────────────────────────────────────────────────────────────
-        {"group": "Stats",  "method": "GET",  "path": "/api/stats",                "auth": True, "description": "User usage statistics"},
+        # ── Stats & Info ──────────────────────────────────────────────────────
+        {"group": "Stats",  "method": "GET",  "path": "/api/stats",                "auth": True,  "description": "User usage statistics"},
+        {"group": "Info",   "method": "GET",  "path": "/api/models",               "auth": False, "description": "All AI models with names, icons, categories"},
     ]
 
     for ep in endpoints:

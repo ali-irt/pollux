@@ -34,7 +34,6 @@ from app.routes import (
     history,
     audio,
     music,
-    song,
     voice_clone,
     transcribe,
     translate,
@@ -147,7 +146,6 @@ app.include_router(voices.router)
 app.include_router(history.router)
 app.include_router(audio.router)
 app.include_router(music.router)
-app.include_router(song.router)
 app.include_router(voice_clone.router)
 app.include_router(transcribe.router)
 app.include_router(translate.router)

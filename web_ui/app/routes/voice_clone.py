@@ -223,9 +223,10 @@ def delete_voice_profile(profile_id: int, user=Depends(get_current_user)):
         conn.close()
         raise HTTPException(status_code=404, detail="Voice profile not found.")
 
-    ref_path = CLONED_VOICES_DIR / row["reference_filename"]
-    if ref_path.exists():
-        ref_path.unlink()
+    for _dir in (CLONED_VOICES_DIR, VOICE_SAMPLES_DIR):
+        _p = _dir / row["reference_filename"]
+        if _p.exists():
+            _p.unlink()
 
     conn.execute("DELETE FROM cloned_voices WHERE id = ?", (profile_id,))
     conn.commit()
@@ -277,6 +278,8 @@ def generate_with_cloned_voice(
         raise HTTPException(status_code=404, detail="Voice profile not found.")
 
     sample_path = VOICE_SAMPLES_DIR / row["reference_filename"]
+    if not sample_path.exists():
+        sample_path = CLONED_VOICES_DIR / row["reference_filename"]
     if not sample_path.exists():
         raise HTTPException(status_code=404, detail="Voice sample file missing.")
 
@@ -493,6 +496,8 @@ def voice_clone_from_profile(
         raise HTTPException(status_code=404, detail="Voice profile not found.")
 
     ref_path = CLONED_VOICES_DIR / profile["reference_filename"]
+    if not ref_path.exists():
+        ref_path = VOICE_SAMPLES_DIR / profile["reference_filename"]
     if not ref_path.exists():
         raise HTTPException(status_code=404, detail="Reference audio file missing from server.")
 

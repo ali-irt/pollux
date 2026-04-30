@@ -88,21 +88,23 @@ def _job_generate_song(job_id: str, user_id: int, lyrics: str, voice_preset: str
     try:
         import torch, numpy as np, scipy.io.wavfile, soundfile as sf
         from scipy.signal import resample_poly
+        from scipy.ndimage import uniform_filter1d
         from math import gcd
 
-        # ── Step 1: vocals via edge-tts (fast, 1-3s) ─────────────────────
-        edge_voice = SONG_VOICE_TO_EDGE.get(voice_preset, "en-US-JennyNeural")
-        clean_lyrics = lyrics.strip()
+        INTRO_SECS = 2.0   # music-only intro before vocals
+        TAIL_SECS  = 1.5   # fade-out tail after vocals
 
+        # ── Step 1: vocals via edge-tts ───────────────────────────────────
+        edge_voice = SONG_VOICE_TO_EDGE.get(voice_preset, "en-US-JennyNeural")
         with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tf:
             tmp_vocal = tf.name
 
         cmd = [
             resolve_bin("edge-tts"),
             "--voice", edge_voice,
-            "--rate=-10%",          # slightly slower → more expressive
-            "--pitch=+2Hz",         # slight lift → more melodic
-            "--text", clean_lyrics,
+            "--rate=-15%",   # slower cadence → more song-like phrasing
+            "--pitch=+3Hz",  # subtle lift for musicality
+            "--text", lyrics.strip(),
             "--write-media", tmp_vocal,
         ]
         proc = subprocess.run(cmd, capture_output=True, timeout=30)
@@ -114,34 +116,48 @@ def _job_generate_song(job_id: str, user_id: int, lyrics: str, voice_preset: str
             vocals_np = vocals_np.mean(axis=1)
         vocals_np = vocals_np.astype(np.float32)
 
-        # ── Step 2: singing effects via librosa (pitch + reverb) ─────────
+        # ── Step 2: vocal FX — chorus + hall reverb ───────────────────────
         try:
             import librosa
-            vocals_np = librosa.effects.pitch_shift(vocals_np, sr=vocal_sr, n_steps=2)
-            # Simple reverb — short delay network
-            wet = np.zeros_like(vocals_np)
-            for delay_ms, decay in [(30, 0.3), (60, 0.2), (100, 0.1)]:
-                d = int(delay_ms * vocal_sr / 1000)
-                if d < len(vocals_np):
-                    padded = np.zeros(len(vocals_np))
-                    padded[d:] = vocals_np[: len(vocals_np) - d] * decay
-                    wet += padded
-            vocals_np = np.clip(vocals_np + wet * 0.4, -1.0, 1.0)
-        except Exception:
-            pass  # effects are optional
 
+            # Chorus: blend three pitch-shifted layers + short delay double
+            pu  = librosa.effects.pitch_shift(vocals_np, sr=vocal_sr, n_steps= 0.25)
+            pd  = librosa.effects.pitch_shift(vocals_np, sr=vocal_sr, n_steps=-0.25)
+            dly = int(0.022 * vocal_sr)
+            doubled = np.zeros_like(vocals_np)
+            doubled[dly:] = vocals_np[:-dly] * 0.22
+            vocals_np = vocals_np + (pu + pd) * 0.10 + doubled
+
+            # Hall reverb — multi-tap delay network
+            wet = np.zeros_like(vocals_np)
+            for ms, decay in [(28, 0.45), (65, 0.28), (120, 0.16), (210, 0.09)]:
+                d = int(ms * vocal_sr / 1000)
+                if d < len(vocals_np):
+                    buf_ = np.zeros(len(vocals_np))
+                    buf_[d:] = vocals_np[: len(vocals_np) - d] * decay
+                    wet += buf_
+            vocals_np = vocals_np + wet * 0.32
+        except Exception:
+            pass  # FX are optional — continue without
+
+        # Normalize vocals to 82 % headroom
         peak = np.max(np.abs(vocals_np))
         if peak > 0:
-            vocals_np = vocals_np / peak * 0.88
+            vocals_np = vocals_np / peak * 0.82
 
-        # ── Step 3: background music via MusicGen (capped at 4s) ─────────
+        # ── Step 3: MusicGen — generate for full song duration ────────────
+        vocal_dur = len(vocals_np) / vocal_sr
+        target_dur = vocal_dur + INTRO_SECS + TAIL_SECS
+        max_tokens = min(int(target_dur * 25.6), 512)
+
         music_np = music_sr = None
         time_left = deadline - time.time()
-        if time_left <= 5:
-            logger.warning(f"Song job {job_id}: skipping MusicGen, only {time_left:.0f}s left")
-        else:
+        if time_left > 10:
             style_label = style.replace("_", " ").title()
-            music_prompt = f"{style_label} instrumental background music, no vocals"
+            music_prompt = (
+                f"{style_label} instrumental background music, "
+                "steady consistent beat, melodic, no vocals, professional studio quality"
+            )
             try:
                 mg_proc, mg_model = _load_musicgen()
                 mg_device = next(mg_model.parameters()).device.type
@@ -149,26 +165,63 @@ def _job_generate_song(job_id: str, user_id: int, lyrics: str, voice_preset: str
                 def _mg_generate():
                     with torch.inference_mode():
                         inp = mg_proc(text=[music_prompt], padding=True, return_tensors="pt").to(mg_device)
-                        return mg_model.generate(**inp, max_new_tokens=102)  # ~4s
+                        return mg_model.generate(**inp, max_new_tokens=max_tokens)
 
-                mg_out = _run_with_timeout(_mg_generate, int(time_left - 3))
+                mg_out = _run_with_timeout(_mg_generate, int(time_left - 5))
                 music_np = mg_out[0, 0].cpu().numpy().astype(np.float32)
                 music_sr = mg_model.config.audio_encoder.sampling_rate
-            except (TimeoutError, Exception) as e:
+                logger.info(f"Song job {job_id}: MusicGen produced {len(music_np)/music_sr:.1f}s of music")
+            except Exception as e:
                 logger.warning(f"Background music skipped in song job {job_id}: {e}")
+        else:
+            logger.warning(f"Song job {job_id}: skipping MusicGen, only {time_left:.0f}s left")
 
-        # ── Step 4: mix vocals + background ──────────────────────────────
+        # ── Step 4: mix with intro + sidechain ducking + fade ─────────────
         if music_np is not None and music_sr is not None:
-            if music_sr != vocal_sr:
+            # Resample music to vocal sample rate
+            if int(music_sr) != int(vocal_sr):
                 g = gcd(int(music_sr), int(vocal_sr))
                 music_np = resample_poly(music_np, int(vocal_sr) // g, int(music_sr) // g)
+
+            # Normalize music to 45 % level
             bg_peak = np.max(np.abs(music_np))
             if bg_peak > 0:
-                music_np = music_np / bg_peak * 0.35
-            n = len(vocals_np)
-            repeats = -(-n // len(music_np)) if len(music_np) < n else 1
-            music_np = np.tile(music_np, repeats)[:n]
-            mixed = np.clip(vocals_np + music_np, -1.0, 1.0)
+                music_np = music_np / bg_peak * 0.45
+
+            # Loop/trim to cover intro + body + tail
+            total_samples = int(target_dur * vocal_sr)
+            if len(music_np) < total_samples:
+                music_np = np.tile(music_np, -(-total_samples // len(music_np)))
+            music_np = music_np[:total_samples]
+
+            intro_n = int(INTRO_SECS * vocal_sr)
+            tail_n  = int(TAIL_SECS  * vocal_sr)
+            body_n  = len(vocals_np)
+
+            intro_music = music_np[:intro_n].copy()
+            body_music  = music_np[intro_n : intro_n + body_n].copy()
+            tail_music  = music_np[intro_n + body_n : intro_n + body_n + tail_n].copy()
+
+            # Sidechain ducking — lower music where vocals are loud
+            frame = int(0.02 * vocal_sr)
+            duck = np.ones(body_n)
+            for i in range(0, body_n, frame):
+                rms = float(np.sqrt(np.mean(vocals_np[i:i+frame] ** 2))) if i < body_n else 0.0
+                duck[i:i+frame] = 1.0 - min(rms * 3.2, 0.52)
+            duck = uniform_filter1d(duck, size=int(0.08 * vocal_sr))
+            body_music *= duck
+
+            mixed_body = np.clip(vocals_np + body_music, -1.0, 1.0)
+
+            # Fade in intro (0.4 s)
+            fi = min(int(0.4 * vocal_sr), len(intro_music))
+            intro_music[:fi] *= np.linspace(0.0, 1.0, fi)
+
+            # Fade out tail
+            if len(tail_music) > 0:
+                tail_music *= np.linspace(1.0, 0.0, len(tail_music))
+
+            mixed = np.concatenate([intro_music, mixed_body, tail_music])
         else:
             mixed = vocals_np
 
