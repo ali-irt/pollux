@@ -10,6 +10,7 @@ services:
       - web_ui/.env
     environment:
       - NUMBA_CACHE_DIR=/tmp/numba_cache
+      - COQUI_TOS_AGREED=1
     ports:
       - "127.0.0.1:8004:8004"
     volumes:
