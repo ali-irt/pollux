@@ -4,7 +4,9 @@ FROM python:3.11-slim AS builder
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
-    PIP_DISABLE_PIP_VERSION_CHECK=1
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    VIRTUAL_ENV=/venv \
+    PATH="/venv/bin:$PATH"
 
 # Build-time system deps (compilers for C-extension packages)
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -16,9 +18,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /build
 
+RUN python -m venv /venv
 COPY web_ui/requirements-prod.txt ./
-RUN mkdir -p /install/lib /install/bin && \
-    pip install --no-cache-dir --prefix=/install -r requirements-prod.txt
+RUN pip install --no-cache-dir -r requirements-prod.txt
 
 # ---------------------------------------------------------------------------
 
@@ -26,7 +28,8 @@ FROM python:3.11-slim AS runtime
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    PYTHONPATH=/usr/local/lib/python3.11/site-packages \
+    VIRTUAL_ENV=/venv \
+    PATH="/venv/bin:$PATH" \
     # Return freed memory to OS promptly — reduces RSS creep under glibc malloc
     MALLOC_TRIM_THRESHOLD_=131072 \
     # Avoid HF tokenizer spawning extra processes that duplicate model memory
@@ -42,9 +45,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy installed Python packages and binaries from builder
-COPY --from=builder /install/lib /usr/local/lib
-COPY --from=builder /install/bin /usr/local/bin
+# Copy the entire venv from builder — PATH already points into it
+COPY --from=builder /venv /venv
 
 # Dedicated non-root user
 RUN groupadd -r pollux && useradd -r -g pollux -d /home/pollux -m pollux
