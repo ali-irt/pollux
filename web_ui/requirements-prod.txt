@@ -1,5 +1,4 @@
-<<<<<<< HEAD
-=======
+
 bcrypt==4.3.0
 absl-py==2.4.0
 aiohappyeyeballs==2.6.1
@@ -103,4 +102,3 @@ uvicorn==0.44.0
 Werkzeug==3.1.8
 wrapt==2.1.2
 yarl==1.23.0
->>>>>>> 07439baf87058bf17bab81f8f4c77728d0437eff
