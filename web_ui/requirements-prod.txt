@@ -88,7 +88,7 @@ tensorboard==2.20.0
 tensorboard-data-server==0.7.2
 threadpoolctl==3.6.0
 tokenizers==0.22.2
-torch==2.11.0
+torch==2.8.0
 torchmetrics==1.5.2
 tqdm==4.67.3
 transformers==5.5.4

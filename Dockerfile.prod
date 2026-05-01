@@ -17,7 +17,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /build
 
 COPY web_ui/requirements-prod.txt ./
-RUN pip install --no-cache-dir --prefix=/install -r requirements-prod.txt
+RUN mkdir -p /install/lib /install/bin && \
+    pip install --no-cache-dir --prefix=/install -r requirements-prod.txt
 
 # ---------------------------------------------------------------------------
 
