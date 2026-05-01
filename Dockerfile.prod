@@ -16,7 +16,7 @@ WORKDIR /build
 
 RUN python -m venv /venv
 COPY web_ui/requirements-prod.txt ./
-RUN pip install --no-cache-dir -r requirements-prod.txt
+RUN pip install --no-cache-dir --no-deps -r requirements-prod.txt
 
 
 FROM python:3.11-slim AS runtime
