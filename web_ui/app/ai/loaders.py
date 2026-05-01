@@ -72,16 +72,32 @@ _xtts_lock = threading.Lock()
 
 def _load_xtts():
     global _xtts_model
+    # Fast path — no lock needed once the model is resident.
+    if _xtts_model is not None:
+        return _xtts_model
     with _xtts_lock:
         if _xtts_model is not None:
             return _xtts_model
         try:
-            from TTS.api import TTS as CoquiTTS
             import torch
-            device = "cuda" if torch.cuda.is_available() else "cpu"
-            _xtts_model = CoquiTTS(
-                "tts_models/multilingual/multi-dataset/xtts_v2"
-            ).to(device)
+            from TTS.api import TTS as CoquiTTS
+
+            # Coqui TTS checkpoints are pickle-based; PyTorch ≥ 2.6 changed the
+            # torch.load default to weights_only=True which rejects them.
+            # Patch torch.load for this call only, then restore.
+            _orig_load = torch.load
+            def _compat_load(*args, **kw):
+                kw.setdefault("weights_only", False)
+                return _orig_load(*args, **kw)
+            torch.load = _compat_load
+            try:
+                device = "cuda" if torch.cuda.is_available() else "cpu"
+                _xtts_model = CoquiTTS(
+                    "tts_models/multilingual/multi-dataset/xtts_v2"
+                ).to(device)
+            finally:
+                torch.load = _orig_load
+
             logger.info(f"XTTS v2 loaded on {device}")
             return _xtts_model
         except ImportError as e:

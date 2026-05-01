@@ -25,8 +25,13 @@ FROM python:3.11-slim AS runtime
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    # Tells Python where the installed packages live
-    PYTHONPATH=/usr/local/lib/python3.11/site-packages
+    PYTHONPATH=/usr/local/lib/python3.11/site-packages \
+    # Return freed memory to OS promptly — reduces RSS creep under glibc malloc
+    MALLOC_TRIM_THRESHOLD_=131072 \
+    # Avoid HF tokenizer spawning extra processes that duplicate model memory
+    TOKENIZERS_PARALLELISM=false \
+    # Cap OpenMP threads — reduces per-request memory spikes on CPU inference
+    OMP_NUM_THREADS=2
 
 # Runtime-only system libraries (no compilers)
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -71,5 +76,7 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=120s --retries=3 \
 CMD ["uvicorn", "main:app", \
      "--host", "0.0.0.0", \
      "--port", "8004", \
+     "--workers", "1", \
+     "--timeout-keep-alive", "2", \
      "--proxy-headers", \
      "--forwarded-allow-ips", "*"]

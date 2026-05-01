@@ -19,6 +19,11 @@ services:
       - pollux-cloned-voices:/app/web_ui/cloned_voices
       # HuggingFace model cache — avoids re-downloading large AI models
       - hf-cache:/home/pollux/.cache/huggingface
+    # Tune to your server RAM.  A single XTTS+MusicGen+Whisper instance needs
+    # ~6-8 GB; 10 GB ceiling prevents the kernel OOM killer from firing before
+    # swap can absorb the spike. memswap_limit = memory + swap allowance.
+    mem_limit: 10g
+    memswap_limit: 14g
     healthcheck:
       test: ["CMD", "curl", "-sf", "http://localhost:8004/api/endpoints"]
       interval: 30s

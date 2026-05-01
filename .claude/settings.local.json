@@ -9,7 +9,9 @@
       "Bash(node -e \"require\\('fs'\\).readFileSync\\('d:/pollux-main/web_ui/static/script.js','utf8'\\)\")",
       "Bash(echo \"exit: $?\")",
       "Read(//c/Users/ali23/.claude/projects/d--pollux-main/memory/**)",
-      "Bash(python3 -c \"open\\('d:/pollux-main/web_ui/requirements.txt'\\).read\\(\\)\")"
+      "Bash(python3 -c \"open\\('d:/pollux-main/web_ui/requirements.txt'\\).read\\(\\)\")",
+      "Bash(Get-ChildItem -Path \"d:\\\\pollux-main\" -Recurse -Filter \"*.py\" -Exclude \"*env*\")",
+      "Bash(Select-Object -ExpandProperty FullName)"
     ]
   }
 }
