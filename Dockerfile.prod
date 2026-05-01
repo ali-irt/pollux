@@ -13,9 +13,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /build
+<<<<<<< HEAD
 RUN python -m venv /venv
 COPY web_ui/requirements-prod.txt ./
 RUN pip install --no-cache-dir -r requirements-prod.txt
+=======
+
+RUN python -m venv /venv
+COPY web_ui/requirements-prod.txt ./
+RUN pip install --no-cache-dir -r requirements-prod.txt
+
+# ---------------------------------------------------------------------------
+>>>>>>> 07439baf87058bf17bab81f8f4c77728d0437eff
 
 FROM python:3.11-slim AS runtime
 
@@ -23,6 +32,10 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     VIRTUAL_ENV=/venv \
     PATH="/venv/bin:$PATH" \
+<<<<<<< HEAD
+=======
+    # Return freed memory to OS promptly — reduces RSS creep under glibc malloc
+>>>>>>> 07439baf87058bf17bab81f8f4c77728d0437eff
     MALLOC_TRIM_THRESHOLD_=131072 \
     TOKENIZERS_PARALLELISM=false \
     OMP_NUM_THREADS=2
@@ -31,7 +44,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libsndfile1 libgomp1 ffmpeg curl \
     && rm -rf /var/lib/apt/lists/*
 
+<<<<<<< HEAD
 COPY --from=builder /venv /venv
+=======
+# Copy the entire venv from builder — PATH already points into it
+COPY --from=builder /venv /venv
+
+# Dedicated non-root user
+>>>>>>> 07439baf87058bf17bab81f8f4c77728d0437eff
 RUN groupadd -r pollux && useradd -r -g pollux -d /home/pollux -m pollux
 WORKDIR /app
 COPY web_ui/ ./web_ui/
@@ -43,7 +63,14 @@ WORKDIR /app/web_ui
 EXPOSE 8004
 HEALTHCHECK --interval=30s --timeout=10s --start-period=120s --retries=3 \
     CMD curl -sf http://localhost:8004/api/endpoints > /dev/null || exit 1
+<<<<<<< HEAD
 CMD ["python", "-m", "uvicorn", "main:app", \
      "--host", "0.0.0.0", "--port", "8004", \
+=======
+
+CMD ["python", "-m", "uvicorn", "main:app", \
+     "--host", "0.0.0.0", \
+     "--port", "8004", \
+>>>>>>> 07439baf87058bf17bab81f8f4c77728d0437eff
      "--timeout-keep-alive", "2", \
      "--proxy-headers", "--forwarded-allow-ips", "*"]
