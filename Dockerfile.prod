@@ -8,21 +8,14 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     VIRTUAL_ENV=/venv \
     PATH="/venv/bin:$PATH"
 
-# Build-time system deps (compilers for C-extension packages)
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential \
-    git \
-    curl \
-    ca-certificates \
+    build-essential git curl ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /build
-
 RUN python -m venv /venv
 COPY web_ui/requirements-prod.txt ./
 RUN pip install --no-cache-dir -r requirements-prod.txt
-
-# ---------------------------------------------------------------------------
 
 FROM python:3.11-slim AS runtime
 
@@ -32,53 +25,26 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PATH="/venv/bin:$PATH" \
     # Return freed memory to OS promptly — reduces RSS creep under glibc malloc
     MALLOC_TRIM_THRESHOLD_=131072 \
-    # Avoid HF tokenizer spawning extra processes that duplicate model memory
     TOKENIZERS_PARALLELISM=false \
-    # Cap OpenMP threads — reduces per-request memory spikes on CPU inference
     OMP_NUM_THREADS=2
 
-# Runtime-only system libraries (no compilers)
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    libsndfile1 \
-    libgomp1 \
-    ffmpeg \
-    curl \
+    libsndfile1 libgomp1 ffmpeg curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy the entire venv from builder — PATH already points into it
 COPY --from=builder /venv /venv
-
-# Dedicated non-root user
 RUN groupadd -r pollux && useradd -r -g pollux -d /home/pollux -m pollux
-
 WORKDIR /app
-
-# Copy application code only (venv, db, outputs excluded via .dockerignore)
 COPY web_ui/ ./web_ui/
-
-# Pre-create runtime directories with correct ownership
-RUN mkdir -p \
-        web_ui/outputs \
-        web_ui/voice_samples \
-        web_ui/cloned_voices \
-        web_ui/db \
+RUN mkdir -p web_ui/outputs web_ui/voice_samples web_ui/cloned_voices web_ui/db \
     && chown -R pollux:pollux /app
-
 USER pollux
-
-# HuggingFace model cache lives in the user's home so it can be volume-mounted
 ENV HF_HOME=/home/pollux/.cache/huggingface
-
 WORKDIR /app/web_ui
-
 EXPOSE 8004
-
 HEALTHCHECK --interval=30s --timeout=10s --start-period=120s --retries=3 \
     CMD curl -sf http://localhost:8004/api/endpoints > /dev/null || exit 1
-
 CMD ["python", "-m", "uvicorn", "main:app", \
-     "--host", "0.0.0.0", \
-     "--port", "8004", \
+     "--host", "0.0.0.0", "--port", "8004", \
      "--timeout-keep-alive", "2", \
-     "--proxy-headers", \
-     "--forwarded-allow-ips", "*"]
+     "--proxy-headers", "--forwarded-allow-ips", "*"]
