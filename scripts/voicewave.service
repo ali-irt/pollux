@@ -1,0 +1,26 @@
+[Unit]
+Description=VoiceWave API
+After=network.target
+
+[Service]
+User=root
+WorkingDirectory=/var/www/voicewave/pollux/web_ui
+Environment="NUMBA_CACHE_DIR=/tmp/numba_cache"
+Environment="COQUI_TOS_AGREED=1"
+Environment="TOKENIZERS_PARALLELISM=false"
+Environment="OMP_NUM_THREADS=2"
+Environment="MALLOC_TRIM_THRESHOLD_=131072"
+ExecStart=/var/www/voicewave/pollux/env/bin/python -m uvicorn main:app \
+    --host 0.0.0.0 \
+    --port 8004 \
+    --timeout-keep-alive 2 \
+    --proxy-headers \
+    --forwarded-allow-ips "*"
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=voicewave
+
+[Install]
+WantedBy=multi-user.target
