@@ -75,13 +75,9 @@ MAX_MUSIC_PROMPT_LENGTH = 1000
 # ---------------------------------------------------------------------------
 
 
-JOB_TIMEOUT_MUSIC = 360
-JOB_TIMEOUT_SONG = 360
-JOB_TIMEOUT_VOICE_CLONE = 550
-
 JOB_TIMEOUT_MUSIC = 300
 JOB_TIMEOUT_SONG = 360
-JOB_TIMEOUT_VOICE_CLONE = 240
+JOB_TIMEOUT_VOICE_CLONE = 550
 
 
 # ---------------------------------------------------------------------------
