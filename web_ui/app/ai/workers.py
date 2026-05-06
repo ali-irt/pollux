@@ -252,14 +252,15 @@ def _job_generate_song(job_id: str, user_id: int, lyrics: str, voice_preset: str
 
 def _xtts_synthesize_chunks(tts, text: str, speaker_wav: str, language: str,
                              deadline: float = None) -> bytes:
-    """Split text into sentences and synthesise each chunk; concatenate results.
-    Keeps each XTTS call short (~100 chars) which is significantly faster on CPU."""
+    """Split text into sentences, synthesise each chunk with quality settings,
+    crossfade boundaries, then normalise the final output."""
     import re, numpy as np, scipy.io.wavfile, soundfile as sf
 
+    # Split on sentence boundaries; keep chunks under 180 chars for XTTS quality
     sentences = re.split(r'(?<=[.!?])\s+', text.strip())
     chunks, current = [], ""
     for s in sentences:
-        if len(current) + len(s) <= 200:
+        if len(current) + len(s) <= 180:
             current = (current + " " + s).strip()
         else:
             if current:
@@ -280,7 +281,14 @@ def _xtts_synthesize_chunks(tts, text: str, speaker_wav: str, language: str,
             time_left = max(5, int(deadline - time.time())) if deadline else 40
             _run_with_timeout(
                 tts.tts_to_file, time_left,
-                text=chunk, speaker_wav=speaker_wav, language=language, file_path=tmp,
+                text=chunk,
+                speaker_wav=speaker_wav,
+                language=language,
+                file_path=tmp,
+                temperature=0.65,        # more consistent, less robotic variance
+                repetition_penalty=10.0, # reduce repeated sounds/words
+                top_p=0.85,              # tighter nucleus sampling
+                speed=1.0,
             )
             data, sr = sf.read(tmp)
             if data.ndim > 1:
@@ -296,7 +304,26 @@ def _xtts_synthesize_chunks(tts, text: str, speaker_wav: str, language: str,
     if not all_audio:
         raise RuntimeError("No audio chunks generated")
 
-    combined = np.concatenate(all_audio)
+    # Crossfade between chunks (20 ms) to eliminate click/pop at boundaries
+    fade_samples = int(sr * 0.02) if sr else 0
+    if len(all_audio) == 1 or fade_samples < 2:
+        combined = np.concatenate(all_audio)
+    else:
+        combined = all_audio[0]
+        for nxt in all_audio[1:]:
+            fade_len = min(fade_samples, len(combined), len(nxt))
+            fade_out = np.linspace(1.0, 0.0, fade_len)
+            fade_in  = np.linspace(0.0, 1.0, fade_len)
+            combined[-fade_len:] *= fade_out
+            nxt_copy = nxt.copy()
+            nxt_copy[:fade_len] *= fade_in
+            combined = np.concatenate([combined, nxt_copy])
+
+    # Normalise to -1 dBFS, preserving dynamics
+    peak = np.max(np.abs(combined))
+    if peak > 0:
+        combined = combined / peak * 0.891  # -1 dBFS headroom
+
     buf = io.BytesIO()
     scipy.io.wavfile.write(buf, rate=int(sr), data=(combined * 32767).astype(np.int16))
     return buf.getvalue()
@@ -311,7 +338,9 @@ def _job_voice_clone(job_id: str, user_id: int, voice_name: str, sample_path: st
     _update_job(job_id, "processing")
     deadline = time.time() + JOB_TIMEOUT_VOICE_CLONE
     try:
-        tts = _load_xtts()
+        tts = _run_with_timeout(_load_xtts, JOB_TIMEOUT_VOICE_CLONE)
+        if time.time() > deadline:
+            raise TimeoutError("Voice clone timed out during model load")
         audio_bytes = _xtts_synthesize_chunks(tts, text, sample_path, language, deadline=deadline)
         gen_id = _save_generation(user_id, f"xtts-v2-clone:{voice_name}", text, audio_bytes, "wav")
         _update_job(job_id, "done", generation_id=gen_id)
@@ -328,7 +357,9 @@ def _job_voice_clone_profile(job_id: str, user_id: int, profile_id: int, ref_pat
     _update_job(job_id, "processing")
     deadline = time.time() + JOB_TIMEOUT_VOICE_CLONE
     try:
-        tts = _load_xtts()
+        tts = _run_with_timeout(_load_xtts, JOB_TIMEOUT_VOICE_CLONE)
+        if time.time() > deadline:
+            raise TimeoutError("Voice clone timed out during model load")
         audio_bytes = _xtts_synthesize_chunks(tts, text, ref_path, language, deadline=deadline)
         gen_id = _save_generation(user_id, f"__voice_clone_profile_{profile_id}__", text, audio_bytes, "wav")
         _update_job(job_id, "done", generation_id=gen_id)
