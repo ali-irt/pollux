@@ -12,7 +12,11 @@
       "Bash(python3 -c \"open\\('d:/pollux-main/web_ui/requirements.txt'\\).read\\(\\)\")",
       "Bash(Get-ChildItem -Path \"d:\\\\pollux-main\" -Recurse -Filter \"*.py\" -Exclude \"*env*\")",
       "Bash(Select-Object -ExpandProperty FullName)",
-      "Bash(env/Scripts/pip freeze *)"
+      "Bash(env/Scripts/pip freeze *)",
+      "Bash(cp \"d:/VoxCPM-Demo/voice_cloning_client.py\" \"d:/pollux-main/web_ui/app/voice_cloning_client.py\")"
+    ],
+    "additionalDirectories": [
+      "d:\\VoxCPM-Demo"
     ]
   }
 }

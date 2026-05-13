@@ -39,6 +39,7 @@ from app.routes import (
     translate,
     enhance,
     stats,
+    voxcpm,
 )
 from db import init_db
 
@@ -63,6 +64,15 @@ async def lifespan(_app: FastAPI):
     threading.Thread(target=_prefetch_music_model, daemon=True).start()
     threading.Thread(target=_prefetch_xtts_model, daemon=True).start()
     threading.Thread(target=_prefetch_whisper_model, daemon=True).start()
+
+    def _warmup_voxcpm():
+        from app.voice_cloning_client import is_available
+        if is_available():
+            logger.info("VoxCPM voice cloning service is reachable")
+        else:
+            logger.warning("VoxCPM voice cloning service is NOT reachable at startup")
+
+    threading.Thread(target=_warmup_voxcpm, daemon=True).start()
     yield
 
 
@@ -150,6 +160,7 @@ app.include_router(transcribe.router)
 app.include_router(translate.router)
 app.include_router(enhance.router)
 app.include_router(stats.router)
+app.include_router(voxcpm.router)
 
 # ---------------------------------------------------------------------------
 # Static files (must be mounted after all API routes)
