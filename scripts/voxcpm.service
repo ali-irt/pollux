@@ -1,0 +1,22 @@
+[Unit]
+Description=VoxCPM Voice Cloning Service (XTTS-v2)
+After=network.target
+
+[Service]
+User=root
+WorkingDirectory=/var/www/voicewave/voice
+EnvironmentFile=-/var/www/voicewave/voice/.env
+Environment="COQUI_TOS_AGREED=1"
+Environment="TOKENIZERS_PARALLELISM=false"
+Environment="OMP_NUM_THREADS=2"
+Environment="CUDA_VISIBLE_DEVICES="
+Environment="MALLOC_TRIM_THRESHOLD_=131072"
+ExecStart=/var/www/voicewave/voice/env/bin/python server.py
+Restart=always
+RestartSec=15
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=voxcpm
+
+[Install]
+WantedBy=multi-user.target

@@ -13,7 +13,13 @@
       "Bash(Get-ChildItem -Path \"d:\\\\pollux-main\" -Recurse -Filter \"*.py\" -Exclude \"*env*\")",
       "Bash(Select-Object -ExpandProperty FullName)",
       "Bash(env/Scripts/pip freeze *)",
-      "Bash(cp \"d:/VoxCPM-Demo/voice_cloning_client.py\" \"d:/pollux-main/web_ui/app/voice_cloning_client.py\")"
+      "Bash(cp \"d:/VoxCPM-Demo/voice_cloning_client.py\" \"d:/pollux-main/web_ui/app/voice_cloning_client.py\")",
+      "Bash(git -C \"d:/pollux-main\" status --short)",
+      "Bash(git -C \"d:/pollux-main\" show --stat HEAD)",
+      "Bash(git -C \"d:/pollux-main\" log --oneline origin/dev..HEAD)",
+      "Bash(git -C \"d:/pollux-main\" log --oneline @{u}..HEAD)",
+      "Bash(git -C \"d:/pollux-main\" log --oneline -5)",
+      "Bash(git -C \"d:/pollux-main\" remote get-url origin)"
     ],
     "additionalDirectories": [
       "d:\\VoxCPM-Demo"
