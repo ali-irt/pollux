@@ -19,7 +19,8 @@
       "Bash(git -C \"d:/pollux-main\" log --oneline origin/dev..HEAD)",
       "Bash(git -C \"d:/pollux-main\" log --oneline @{u}..HEAD)",
       "Bash(git -C \"d:/pollux-main\" log --oneline -5)",
-      "Bash(git -C \"d:/pollux-main\" remote get-url origin)"
+      "Bash(git -C \"d:/pollux-main\" remote get-url origin)",
+      "Bash(Get-ChildItem -Path \"d:\\\\pollux-main\" -Recurse -ErrorAction SilentlyContinue)"
     ],
     "additionalDirectories": [
       "d:\\VoxCPM-Demo"

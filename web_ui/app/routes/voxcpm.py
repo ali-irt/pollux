@@ -4,6 +4,7 @@ VoxCPM-Demo voice cloning microservice proxy routes.
 Forwards requests to the XTTS-v2 server running on port 8008.
 """
 import logging
+from datetime import datetime, timezone
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
@@ -17,6 +18,7 @@ from app.config import (
     VOXCPM_MAX_AUDIO_BYTES,
 )
 from app.security import get_current_user
+from db import get_db
 
 logger = logging.getLogger(__name__)
 limiter = Limiter(key_func=get_remote_address)
@@ -58,6 +60,18 @@ async def voice_clone(
         mp3 = clone_voice(text=text.strip(), ref_audio_bytes=audio_bytes, ref_audio_format=ext.lstrip(".") or "wav")
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"Voice cloning failed: {exc}")
+
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+    filename = f"voxcpm_{user['id']}_{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}.mp3"
+    snippet = text.strip()[:200]
+    conn = get_db()
+    conn.execute(
+        "INSERT INTO generations (user_id, filename, model, text_snippet, created_at, audio_data, audio_format)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (user["id"], filename, "voxcpm", snippet, now, mp3, "mp3"),
+    )
+    conn.commit()
+    conn.close()
 
     logger.info("VoxCPM clone: %d chars for user %s", len(text), user["id"])
     return Response(content=mp3, media_type="audio/mpeg")
