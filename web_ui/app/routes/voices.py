@@ -30,10 +30,6 @@ def load_voices_json() -> dict:
         return json.load(f)
 
 
-def is_premium_voice(model_info: dict) -> bool:
-    return model_info.get("quality", "") in PREMIUM_QUALITIES
-
-
 def annotate_voices(voices: dict, is_premium_user: bool = True) -> dict:
     for info in voices.values():
         info["is_premium"] = False
@@ -50,17 +46,3 @@ def annotate_voices(voices: dict, is_premium_user: bool = True) -> dict:
 def get_voices(user=Depends(get_current_user)):
     voices = annotate_voices(load_voices_json(), user["is_premium"])
     return list(voices.values())
-
-
-@router.get("/api/voices/free", summary="Free-tier voices only")
-def get_free_voices(user=Depends(get_current_user)):
-    voices = annotate_voices(load_voices_json(), user["is_premium"])
-    filtered = [v for v in voices.values() if not v.get("is_premium", False)]
-    return filtered
-
-
-@router.get("/api/voices/premium", summary="Premium voices only")
-def get_premium_voices(user=Depends(get_current_user)):
-    voices = annotate_voices(load_voices_json(), user["is_premium"])
-    filtered = [v for v in voices.values() if v.get("is_premium", False)]
-    return filtered
