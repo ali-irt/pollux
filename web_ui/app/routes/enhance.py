@@ -122,12 +122,11 @@ async def enhance_audio(
 
     now = datetime.utcnow().isoformat()
     conn = get_db()
-    cur = conn.execute(
-        "INSERT INTO generations (user_id, filename, model, text_snippet, created_at, audio_data, audio_format)"
-        " VALUES (?,?,?,?,?,?,?)",
-        (user["id"], "", "__enhanced__", f"Enhanced: {file.filename}", now, audio_bytes, "wav"),
+    conn.execute(
+        "INSERT INTO generations (user_id, filename, model, text_snippet, created_at)"
+        " VALUES (?,?,?,?,?)",
+        (user["id"], "", "__enhanced__", f"Enhanced: {file.filename}", now),
     )
-    gen_id = cur.lastrowid
     conn.execute(
         "UPDATE users SET generation_count = generation_count + 1 WHERE id = ?", (user["id"],)
     )
@@ -138,8 +137,5 @@ async def enhance_audio(
     return Response(
         content=audio_bytes,
         media_type="audio/wav",
-        headers={
-            "Content-Disposition": "inline; filename=enhanced.wav",
-            "X-Generation-Id": str(gen_id),
-        },
+        headers={"Content-Disposition": "inline; filename=enhanced.wav"},
     )

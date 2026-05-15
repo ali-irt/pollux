@@ -201,12 +201,11 @@ def generate_audio(req: GenerateRequest, request: Request, user=Depends(get_curr
         "UPDATE users SET generation_count = generation_count + 1 WHERE id = ?",
         (user["id"],),
     )
-    cursor = conn.execute(
-        "INSERT INTO generations (user_id, filename, model, text_snippet, created_at, audio_data, audio_format)"
-        " VALUES (?,?,?,?,?,?,?)",
-        (user["id"], "", req.model, req.text[:100], now, audio_bytes, ext.lstrip(".")),
+    conn.execute(
+        "INSERT INTO generations (user_id, filename, model, text_snippet, created_at)"
+        " VALUES (?,?,?,?,?)",
+        (user["id"], "", req.model, req.text[:100], now),
     )
-    generation_id = cursor.lastrowid
     conn.commit()
     conn.close()
 
@@ -214,8 +213,5 @@ def generate_audio(req: GenerateRequest, request: Request, user=Depends(get_curr
     return Response(
         content=audio_bytes,
         media_type=media_type,
-        headers={
-            "Content-Disposition": f"inline; filename=output{ext}",
-            "X-Generation-Id": str(generation_id),
-        },
+        headers={"Content-Disposition": f"inline; filename=output{ext}"},
     )

@@ -1,6 +1,6 @@
 """
 app/routes/song.py
-Song generation endpoints (edge-tts + MusicGen, fully local).
+Song generation endpoint (alias router, not registered in main.py — see music.py).
 """
 import logging
 
@@ -9,8 +9,9 @@ from pydantic import BaseModel
 
 from app.config import (
     MAX_SONG_LYRICS_LENGTH,
-    BARK_VOICE_PRESETS,
-    SONG_STYLE_PROMPTS,
+    ACE_STEP_STYLE_TAGS,
+    ACE_STEP_QUALITY_PRESETS,
+    ACE_STEP_MAX_DURATION,
 )
 from app.security import get_current_user
 from app.jobs import _create_job, _job_executor
@@ -23,42 +24,49 @@ router = APIRouter()
 
 class SongGenerateRequest(BaseModel):
     lyrics: str
-    voice_preset: str = "en_singer_3"
     style: str = "pop"
-    quality: str = "small"
+    audio_duration: int = 60
+    quality: str = "balanced"
 
 
-@router.post("/api/generate_song", summary="Generate a full AI song with vocals from lyrics (returns job_id immediately)")
+@router.post("/api/generate_song", summary="Generate a full AI song with vocals via ACE-Step 1.5")
 def generate_song(request: SongGenerateRequest, user=Depends(get_current_user)):
     if not request.lyrics or not request.lyrics.strip():
         raise HTTPException(status_code=400, detail="Lyrics cannot be empty.")
     if len(request.lyrics) > MAX_SONG_LYRICS_LENGTH:
         raise HTTPException(status_code=400, detail=f"Lyrics exceed {MAX_SONG_LYRICS_LENGTH} characters.")
-    if request.voice_preset not in BARK_VOICE_PRESETS:
-        raise HTTPException(status_code=400, detail=f"Unknown voice preset. Choose from: {list(BARK_VOICE_PRESETS.keys())}")
-    if request.style not in SONG_STYLE_PROMPTS:
-        raise HTTPException(status_code=400, detail=f"Unknown style. Choose from: {list(SONG_STYLE_PROMPTS.keys())}")
-    if request.quality not in {"small", "large"}:
-        raise HTTPException(status_code=400, detail="quality must be 'small' or 'large'.")
+    if request.style not in ACE_STEP_STYLE_TAGS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown style '{request.style}'. Choose from: {list(ACE_STEP_STYLE_TAGS.keys())}",
+        )
+    if request.quality not in ACE_STEP_QUALITY_PRESETS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown quality '{request.quality}'. Choose from: {list(ACE_STEP_QUALITY_PRESETS.keys())}",
+        )
+    if not (10 <= request.audio_duration <= ACE_STEP_MAX_DURATION):
+        raise HTTPException(status_code=400, detail=f"audio_duration must be 10–{ACE_STEP_MAX_DURATION} seconds.")
 
     job_id = _create_job(user["id"], "song")
     _job_executor.submit(
-        _job_generate_song, job_id, user["id"],
-        request.lyrics, request.voice_preset, request.style, request.quality,
+        _job_generate_song,
+        job_id, user["id"], request.lyrics, request.style,
+        request.audio_duration, request.quality,
     )
-    logger.info(f"Song job {job_id} queued for user {user['email']}")
+    logger.info(
+        "Song job %s queued for user %s (style=%s, quality=%s, duration=%ds)",
+        job_id, user["email"], request.style, request.quality, request.audio_duration,
+    )
     return {"job_id": job_id, "status": "pending", "poll_url": f"/api/jobs/{job_id}"}
 
 
-@router.get("/api/song/voices", summary="List available Bark voice presets for song generation")
-def list_song_voices(user=Depends(get_current_user)):
+@router.get("/api/song/styles", summary="List available styles for song generation")
+def list_song_styles(user=Depends(get_current_user)):
     return {
-        "voices": [
-            {"id": k, "bark_preset": v, "label": k.replace("_", " ").title()}
-            for k, v in BARK_VOICE_PRESETS.items()
-        ],
+        "model": "ace-step-1.5",
         "styles": [
             {"id": k, "label": k.replace("_", " ").title()}
-            for k in SONG_STYLE_PROMPTS
+            for k in ACE_STEP_STYLE_TAGS
         ],
     }

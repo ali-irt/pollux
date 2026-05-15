@@ -27,7 +27,7 @@ def get_history(
         (user["id"],),
     ).fetchone()["cnt"]
     rows = conn.execute(
-        "SELECT id, user_id, filename, model, text_snippet, created_at, audio_format"
+        "SELECT id, user_id, filename, model, text_snippet, created_at"
         " FROM generations WHERE user_id = ? AND model NOT IN ('__batch_zip__')"
         " ORDER BY created_at DESC LIMIT ? OFFSET ?",
         (user["id"], per_page, offset),

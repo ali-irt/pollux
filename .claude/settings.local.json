@@ -20,7 +20,20 @@
       "Bash(git -C \"d:/pollux-main\" log --oneline @{u}..HEAD)",
       "Bash(git -C \"d:/pollux-main\" log --oneline -5)",
       "Bash(git -C \"d:/pollux-main\" remote get-url origin)",
-      "Bash(Get-ChildItem -Path \"d:\\\\pollux-main\" -Recurse -ErrorAction SilentlyContinue)"
+      "Bash(Get-ChildItem -Path \"d:\\\\pollux-main\" -Recurse -ErrorAction SilentlyContinue)",
+      "WebFetch(domain:github.com)",
+      "WebSearch",
+      "Bash(python -c \"import acestep; print\\(acestep.__file__\\)\")",
+      "Bash(.\\\\env\\\\Scripts\\\\python.exe -c \"import acestep; print\\(acestep.__file__\\)\")",
+      "PowerShell(D:\\\\pollux-main\\\\env\\\\Scripts\\\\python.exe -c \"import acestep; print\\(acestep.__file__\\)\" 2>&1)",
+      "PowerShell(D:\\\\pollux-main\\\\env\\\\Scripts\\\\python.exe -c \"import torchcodec; print\\('ok'\\)\" 2>&1)",
+      "PowerShell(ffmpeg -version 2>&1)",
+      "PowerShell(D:\\\\pollux-main\\\\env\\\\Scripts\\\\pip show torchcodec 2>&1)",
+      "PowerShell(where.exe ffmpeg; \\(Get-Item \\(where.exe ffmpeg\\)\\).Directory.FullName)",
+      "PowerShell(D:\\\\pollux-main\\\\env\\\\Scripts\\\\pip show acestep 2>&1)",
+      "PowerShell(D:\\\\pollux-main\\\\env\\\\Scripts\\\\python.exe -c \"import torchaudio; print\\(torchaudio.__version__\\); print\\(torchaudio.list_audio_backends\\(\\)\\)\" 2>&1)",
+      "PowerShell(D:\\\\pollux-main\\\\env\\\\Scripts\\\\python.exe -c \"import soundfile; print\\('soundfile:', soundfile.__version__\\)\" 2>&1)",
+      "PowerShell(D:\\\\pollux-main\\\\env\\\\Scripts\\\\python.exe -c \"import scipy; print\\('scipy:', scipy.__version__\\)\" 2>&1)"
     ],
     "additionalDirectories": [
       "d:\\VoxCPM-Demo"

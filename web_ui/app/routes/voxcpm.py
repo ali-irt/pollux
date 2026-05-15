@@ -66,9 +66,9 @@ async def voice_clone(
     snippet = text.strip()[:200]
     conn = get_db()
     conn.execute(
-        "INSERT INTO generations (user_id, filename, model, text_snippet, created_at, audio_data, audio_format)"
-        " VALUES (?, ?, ?, ?, ?, ?, ?)",
-        (user["id"], filename, "voxcpm", snippet, now, mp3, "mp3"),
+        "INSERT INTO generations (user_id, filename, model, text_snippet, created_at)"
+        " VALUES (?, ?, ?, ?, ?)",
+        (user["id"], filename, "voxcpm", snippet, now),
     )
     conn.commit()
     conn.close()

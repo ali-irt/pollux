@@ -68,14 +68,11 @@ MAX_PASSWORD_LENGTH = 56
 MIN_PASSWORD_LENGTH = 8
 MAX_TEXT_LENGTH = 5000
 MAX_TRANSLATION_LENGTH = 5000
-MAX_MUSIC_PROMPT_LENGTH = 1000
-
 # ---------------------------------------------------------------------------
 # Job timeout limits (seconds)
 # ---------------------------------------------------------------------------
 
 
-JOB_TIMEOUT_MUSIC = 300
 JOB_TIMEOUT_SONG = 360
 JOB_TIMEOUT_VOICE_CLONE = 550
 
@@ -112,58 +109,41 @@ WHISPER_ALLOWED_EXT = {".mp3", ".wav", ".ogg", ".m4a", ".mp4", ".flac", ".webm",
 WHISPER_ALLOWED_SIZES = {"tiny", "base", "small"}
 
 # ---------------------------------------------------------------------------
-# Song generation constants
+# Song generation constants (ACE-Step 1.5)
 # ---------------------------------------------------------------------------
 
 MAX_SONG_LYRICS_LENGTH = 800
+ACE_STEP_MODEL_ID = "stepfun-ai/ACE-Step-v1.5-3.5B"
+ACE_STEP_LOCAL_DIR = MODELS_DIR / "ace-step-1.5"
+ACE_STEP_MAX_DURATION = 240  # seconds
 
-BARK_VOICE_PRESETS = {
-    "en_singer_1": "v2/en_speaker_1",
-    "en_singer_2": "v2/en_speaker_3",
-    "en_singer_3": "v2/en_speaker_6",
-    "en_singer_4": "v2/en_speaker_9",
-    "en_female_1": "v2/en_speaker_0",
-    "en_female_2": "v2/en_speaker_8",
-    "zh_singer_1": "v2/zh_speaker_2",
-    "es_singer_1": "v2/es_speaker_2",
-    "fr_singer_1": "v2/fr_speaker_2",
-    "de_singer_1": "v2/de_speaker_2",
-    "hi_singer_1": "v2/hi_speaker_2",
-    "ar_singer_1": "v2/en_speaker_6",
-    "tr_singer_1": "v2/tr_speaker_2",
-    "ru_singer_1": "v2/ru_speaker_2",
-    "pt_singer_1": "v2/pt_speaker_2",
+# Comma-separated tag strings used as the ACE-Step `prompt` parameter.
+# More specific tags = better model adherence (Suno-style descriptors).
+ACE_STEP_STYLE_TAGS = {
+    "pop":        "pop, catchy melody, polished studio production, vocal harmonies, radio-ready, upbeat",
+    "ballad":     "ballad, slow tempo, emotional piano, heartfelt vocals, intimate, crescendo",
+    "hiphop":     "hip hop, trap, 808 bass, hi-hats, rhythmic rap flow, hard-hitting beat",
+    "rock":       "rock, electric guitar riffs, crashing drums, powerful lead vocals, distortion, anthem",
+    "jazz":       "jazz, smooth saxophone, walking bass, piano improvisation, swing rhythm, lounge",
+    "rnb":        "r&b, soul, groovy bassline, silky smooth vocals, lush chords, sensual",
+    "electronic": "electronic, synth leads, four-on-the-floor EDM, pulsing bass, atmospheric pads",
+    "acoustic":   "acoustic folk, fingerpicked guitar, warm vocals, intimate, unplugged, coffeehouse",
+    "classical":  "orchestral, strings, cinematic swell, grand piano, classical composition, epic",
+    "country":    "country, twangy guitar, fiddle, storytelling vocals, heartfelt, Southern charm",
+    "reggae":     "reggae, island vibe, offbeat skank guitar, deep bass, relaxed, Rastafari",
+    "metal":      "heavy metal, down-tuned guitar riffs, blast beats, aggressive screaming vocals, brutal",
+    "lofi":       "lo-fi hip hop, chill beats, vinyl crackle, mellow chords, relaxing, study music",
+    "latin":      "latin pop, salsa, percussion, trumpet, infectious groove, passionate vocals",
 }
 
-SONG_VOICE_TO_EDGE = {
-    "en_singer_1": "en-US-GuyNeural",
-    "en_singer_2": "en-US-DavisNeural",
-    "en_singer_3": "en-US-JennyNeural",
-    "en_singer_4": "en-US-AriaNeural",
-    "en_female_1": "en-US-SaraNeural",
-    "en_female_2": "en-US-NancyNeural",
-    "zh_singer_1": "zh-CN-XiaoxiaoNeural",
-    "es_singer_1": "es-ES-ElviraNeural",
-    "fr_singer_1": "fr-FR-DeniseNeural",
-    "de_singer_1": "de-DE-KatjaNeural",
-    "hi_singer_1": "hi-IN-SwaraNeural",
-    "ar_singer_1": "ar-SA-ZariyahNeural",
-    "tr_singer_1": "tr-TR-EmelNeural",
-    "ru_singer_1": "ru-RU-SvetlanaNeural",
-    "pt_singer_1": "pt-BR-FranciscaNeural",
-}
-
-SONG_STYLE_PROMPTS = {
-    "pop":        "[upbeat pop music]",
-    "ballad":     "[slow piano ballad]",
-    "hiphop":     "[hip hop beat]",
-    "rock":       "[electric guitar rock]",
-    "jazz":       "[jazz background]",
-    "rnb":        "[smooth R&B rhythm]",
-    "electronic": "[electronic synth beat]",
-    "acoustic":   "[acoustic guitar]",
-    "classical":  "[orchestral classical music]",
-    "none":       "",
+# Inference quality presets: (infer_step, scheduler_type, guidance_scale)
+# guidance_scale must stay >= 7.0 — lower values let noise dominate vocals.
+# Speed comes from fewer steps, not lower guidance.
+ACE_STEP_QUALITY_PRESETS = {
+    "turbo":    (10,  "euler", 7.0),   # ~2–4 min on CPU; audible vocals, some noise
+    "fast":     (20,  "euler", 7.0),   # ~4–8 min on CPU; clean vocals
+    "balanced": (30,  "euler", 7.0),   # ~8–15 min on CPU; solid quality
+    "best":     (60,  "heun",  7.5),   # ~15–30 min on CPU; maximum quality
 }
 
 # ---------------------------------------------------------------------------
@@ -207,3 +187,12 @@ VOXCPM_ALLOWED_EXT = {".wav", ".mp3", ".ogg", ".flac", ".m4a"}
 # ---------------------------------------------------------------------------
 
 _WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
+
+# ---------------------------------------------------------------------------
+# Database
+# ---------------------------------------------------------------------------
+
+DATABASE_URL = os.environ.get(
+    "DATABASE_URL",
+    "postgresql://pollux:pollux@localhost:5432/pollux",
+)
