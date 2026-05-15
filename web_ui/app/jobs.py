@@ -9,7 +9,7 @@ import secrets
 import threading
 from datetime import datetime
 
-from app.config import JOB_TIMEOUT_MUSIC, JOB_TIMEOUT_SONG, JOB_TIMEOUT_VOICE_CLONE  # noqa: F401
+from app.config import JOB_TIMEOUT_SONG, JOB_TIMEOUT_VOICE_CLONE  # noqa: F401
 from db import get_db
 
 logger = logging.getLogger(__name__)
@@ -19,12 +19,29 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 _job_executor = concurrent.futures.ThreadPoolExecutor(
-    max_workers=3, thread_name_prefix="pollux_job"
+    max_workers=1, thread_name_prefix="pollux_job"
 )
 
 # ---------------------------------------------------------------------------
 # Job lifecycle helpers
 # ---------------------------------------------------------------------------
+
+
+def _count_active_jobs(user_id: int, job_type: str | None = None) -> int:
+    """Return the number of pending/processing jobs for a user (optionally filtered by type)."""
+    conn = get_db()
+    if job_type:
+        row = conn.execute(
+            "SELECT COUNT(*) AS count FROM jobs WHERE user_id=? AND type=? AND status IN ('pending','processing')",
+            (user_id, job_type),
+        ).fetchone()
+    else:
+        row = conn.execute(
+            "SELECT COUNT(*) AS count FROM jobs WHERE user_id=? AND status IN ('pending','processing')",
+            (user_id,),
+        ).fetchone()
+    conn.close()
+    return row["count"] if row else 0
 
 
 def _create_job(user_id: int, job_type: str) -> str:
@@ -40,25 +57,26 @@ def _create_job(user_id: int, job_type: str) -> str:
     return job_id
 
 
-def _update_job(job_id: str, status: str, generation_id: int = None, error_message: str = None):
+def _update_job(job_id: str, status: str, generation_id: int = None,
+                result_path: str = None, error_message: str = None):
     now = datetime.utcnow().isoformat()
     conn = get_db()
     conn.execute(
-        "UPDATE jobs SET status=?, generation_id=?, error_message=?, updated_at=? WHERE id=?",
-        (status, generation_id, error_message, now, job_id),
+        "UPDATE jobs SET status=?, generation_id=?, result_path=?, error_message=?, updated_at=? WHERE id=?",
+        (status, generation_id, result_path, error_message, now, job_id),
     )
     conn.commit()
     conn.close()
 
 
-def _save_generation(user_id: int, model_label: str, snippet: str, audio_bytes: bytes, fmt: str) -> int:
+def _save_generation(user_id: int, model_label: str, snippet: str) -> int:
     now = datetime.utcnow().isoformat()
     conn = get_db()
     conn.execute("UPDATE users SET generation_count = generation_count + 1 WHERE id = ?", (user_id,))
     cur = conn.execute(
-        "INSERT INTO generations (user_id, filename, model, text_snippet, created_at, audio_data, audio_format)"
-        " VALUES (?,?,?,?,?,?,?)",
-        (user_id, "", model_label, snippet[:100], now, audio_bytes, fmt),
+        "INSERT INTO generations (user_id, filename, model, text_snippet, created_at)"
+        " VALUES (?,?,?,?,?) RETURNING id",
+        (user_id, "", model_label, snippet[:100], now),
     )
     gen_id = cur.lastrowid
     conn.commit()
