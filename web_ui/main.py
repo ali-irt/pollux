@@ -23,7 +23,7 @@ from slowapi.util import get_remote_address
 
 from app.config import ALLOWED_ORIGINS, BASE_DIR
 from app.ai.loaders import (
-    _prefetch_music_model,
+    _prefetch_ace_step_model,
     _prefetch_xtts_model,
     _prefetch_whisper_model,
 )
@@ -34,11 +34,11 @@ from app.routes import (
     history,
     audio,
     music,
-    voice_clone,
     transcribe,
     translate,
     enhance,
     stats,
+    voxcpm,
 )
 from db import init_db
 
@@ -60,10 +60,36 @@ async def lifespan(_app: FastAPI):
         logger.info(f"Torch CPU threads set to {n}")
     except Exception:
         pass
-    threading.Thread(target=_prefetch_music_model, daemon=True).start()
+    threading.Thread(target=_prefetch_ace_step_model, daemon=True).start()
     threading.Thread(target=_prefetch_xtts_model, daemon=True).start()
     threading.Thread(target=_prefetch_whisper_model, daemon=True).start()
+
+    def _warmup_voxcpm():
+        from app.voice_cloning_client import is_available
+        if is_available():
+            logger.info("VoxCPM voice cloning service is reachable")
+        else:
+            logger.warning("VoxCPM voice cloning service is NOT reachable at startup")
+
+    threading.Thread(target=_warmup_voxcpm, daemon=True).start()
     yield
+
+    # Graceful shutdown: close DB pool and mark orphaned jobs as failed
+    try:
+        from db.database import _pool
+        from db import get_db
+        conn = get_db()
+        conn.execute(
+            "UPDATE jobs SET status='failed', error_message='Server shutdown'"
+            " WHERE status IN ('pending','processing')"
+        )
+        conn.commit()
+        conn.close()
+        if _pool:
+            _pool.closeall()
+        logger.info("DB pool closed on shutdown")
+    except Exception as exc:
+        logger.warning("Shutdown cleanup error: %s", exc)
 
 
 # ---------------------------------------------------------------------------
@@ -96,19 +122,27 @@ app.add_middleware(
 
 
 @app.middleware("http")
+async def security_headers(request: Request, call_next):
+    response = await call_next(request)
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    if request.url.scheme == "https":
+        response.headers["Strict-Transport-Security"] = "max-age=63072000; includeSubDomains"
+    return response
+
+
+@app.middleware("http")
 async def log_requests(request: Request, call_next):
-    """Log all HTTP requests for audit trail."""
     start = time.time()
     response = await call_next(request)
     duration = time.time() - start
-
     logger.info(
         f"{request.method} {request.url.path} - "
         f"Status: {response.status_code} - "
         f"Duration: {duration:.3f}s - "
         f"IP: {request.client.host if request.client else 'unknown'}"
     )
-
     return response
 
 # ---------------------------------------------------------------------------
@@ -136,6 +170,22 @@ async def validation_error_handler(request: Request, exc: RequestValidationError
 
 
 # ---------------------------------------------------------------------------
+# Health check (no auth — used by load balancers, Docker, k8s)
+# ---------------------------------------------------------------------------
+
+@app.get("/health", include_in_schema=False)
+def health():
+    try:
+        from db import get_db
+        conn = get_db()
+        conn.execute("SELECT 1")
+        conn.close()
+        return {"status": "ok", "db": "ok"}
+    except Exception as exc:
+        return JSONResponse(status_code=503, content={"status": "degraded", "db": str(exc)})
+
+
+# ---------------------------------------------------------------------------
 # Routers
 # ---------------------------------------------------------------------------
 
@@ -145,11 +195,11 @@ app.include_router(voices.router)
 app.include_router(history.router)
 app.include_router(audio.router)
 app.include_router(music.router)
-app.include_router(voice_clone.router)
 app.include_router(transcribe.router)
 app.include_router(translate.router)
 app.include_router(enhance.router)
 app.include_router(stats.router)
+app.include_router(voxcpm.router)
 
 # ---------------------------------------------------------------------------
 # Static files (must be mounted after all API routes)

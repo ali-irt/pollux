@@ -1,4 +1,25 @@
 services:
+  db:
+    image: postgres:16-alpine
+    container_name: pollux-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: pollux
+      POSTGRES_USER: pollux
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-pollux_secret}
+    volumes:
+      - pollux-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pollux -d pollux"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
   api:
     build:
       context: .
@@ -6,13 +27,19 @@ services:
     image: pollux-api:latest
     container_name: pollux-api
     restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
     env_file:
       - web_ui/.env
+    environment:
+      - NUMBA_CACHE_DIR=/tmp/numba_cache
+      - COQUI_TOS_AGREED=1
+      - DATABASE_URL=postgresql://pollux:${POSTGRES_PASSWORD:-pollux_secret}@db:5432/pollux
     ports:
       - "127.0.0.1:8004:8004"
     volumes:
       # Persistent data — survives container restarts and rebuilds
-      - pollux-db:/app/web_ui/db
       - pollux-outputs:/app/web_ui/outputs
       - pollux-models:/app/web_ui/models
       - pollux-voice-samples:/app/web_ui/voice_samples
@@ -25,7 +52,7 @@ services:
     mem_limit: 10g
     memswap_limit: 14g
     healthcheck:
-      test: ["CMD", "curl", "-sf", "http://localhost:8004/api/endpoints"]
+      test: ["CMD", "curl", "-sf", "http://localhost:8004/health"]
       interval: 30s
       timeout: 10s
       start_period: 120s
@@ -37,7 +64,7 @@ services:
         max-file: "3"
 
 volumes:
-  pollux-db:
+  pollux-pgdata:
   pollux-outputs:
   pollux-models:
   pollux-voice-samples:

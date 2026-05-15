@@ -69,7 +69,8 @@ class ChangePasswordRequest(BaseModel):
 
 
 @router.post("/api/auth/register", summary="Register a new account")
-def register(req: RegisterRequest):
+@limiter.limit("5/minute")
+def register(req: RegisterRequest, request: Request):
     try:
         req.email = validate_and_normalize_email(req.email)
     except HTTPException:
@@ -91,7 +92,8 @@ def register(req: RegisterRequest):
 
     now = datetime.utcnow().isoformat()
     cursor = conn.execute(
-        "INSERT INTO users (email, password_hash, plan, generation_count, credits, is_premium, created_at) VALUES (?, ?, 'free', 0, ?, ?, ?)",
+        "INSERT INTO users (email, password_hash, plan, generation_count, credits, is_premium, created_at)"
+        " VALUES (?, ?, 'free', 0, ?, ?, ?) RETURNING id",
         (
             req.email,
             hash_password(req.password),
@@ -275,7 +277,7 @@ def upgrade_to_premium(user=Depends(get_current_user)):
     "/api/mock-payment-webhook", summary="Mock endpoint for payment gateway webhook (dev only)"
 )
 def mock_payment_webhook(user_id: int, request: Request):
-    if os.environ.get("ENVIRONMENT") != "development":
+    if os.environ.get("ENVIRONMENT", "production") != "development":
         raise HTTPException(status_code=404, detail="Not found.")
 
     secret = request.headers.get("X-Webhook-Secret", "")

@@ -56,9 +56,8 @@ def get_job(job_id: str, user=Depends(get_current_user)):
         raise HTTPException(status_code=404, detail="Job not found.")
 
     result = dict(job)
-    if job["status"] == "done" and job["generation_id"]:
-        result["audio_url"] = f"/api/audio/{job['generation_id']}"
-        result["download_url"] = f"/api/audio/{job['generation_id']}/download"
+    if job["status"] == "done" and job.get("result_path"):
+        result["download_url"] = f"/api/jobs/{job_id}/download"
     return result
 
 
@@ -69,8 +68,7 @@ def list_models():
         {"id": "piper",             "name": "Piper TTS",        "icon": "🎙️",  "category": "tts",          "speed": "fast",   "local": True,  "description": "Fast offline neural TTS"},
         {"id": "bark",              "name": "Bark",             "icon": "🐶",  "category": "tts",          "speed": "slow",   "local": True,  "description": "Suno Bark — expressive AI speech with emotion & laughter"},
         {"id": "xtts-v2",           "name": "Voice Clone",      "icon": "🎭",  "category": "voice_clone",  "speed": "medium", "local": True,  "description": "Coqui XTTS v2 — clone any voice in 17 languages"},
-        {"id": "musicgen",          "name": "Music Generator",  "icon": "🎵",  "category": "music",        "speed": "slow",   "local": True,  "description": "Meta MusicGen — create background music from a text prompt"},
-        {"id": "musicgen+vocals",   "name": "AI Song",          "icon": "🎤",  "category": "music",        "speed": "slow",   "local": True,  "description": "Lyrics → vocals (Edge TTS) + background music (MusicGen)"},
+        {"id": "ace-step-1.5",      "name": "AI Song",          "icon": "🎤",  "category": "music",        "speed": "slow",   "local": True,  "description": "ACE-Step 1.5 — full songs with real vocals from lyrics + style tags"},
         {"id": "whisper",           "name": "Whisper",          "icon": "👂",  "category": "transcribe",   "speed": "medium", "local": True,  "description": "OpenAI Whisper — speech-to-text in 99 languages"},
         {"id": "deep-translator",   "name": "Translator",       "icon": "🌐",  "category": "translate",    "speed": "fast",   "local": False, "description": "Text translation via Google Translate"},
         {"id": "librosa",           "name": "Audio Enhancer",   "icon": "✨",  "category": "enhance",      "speed": "fast",   "local": True,  "description": "Normalize, fade, reverb, pitch shift, speed"},
@@ -99,10 +97,8 @@ def list_endpoints():
         {"group": "History", "method": "GET",    "path": "/api/history",           "auth": True,  "description": "Paginated generation history (?page=1&per_page=20)"},
         {"group": "History", "method": "DELETE", "path": "/api/history/{entry_id}","auth": True,  "description": "Delete a single history entry"},
         {"group": "History", "method": "DELETE", "path": "/api/history",           "auth": True,  "description": "Clear all history"},
-        # ── Audio files ───────────────────────────────────────────────────────
-        {"group": "Audio", "method": "GET",    "path": "/api/audio/{generation_id}",          "auth": True, "description": "Stream audio from DB"},
-        {"group": "Audio", "method": "GET",    "path": "/api/audio/{generation_id}/download", "auth": True, "description": "Download audio from DB (removes from storage after export)"},
-        {"group": "Audio", "method": "DELETE", "path": "/api/audio/{generation_id}",          "auth": True, "description": "Delete audio from DB"},
+        # ── Audio download ────────────────────────────────────────────────────
+        {"group": "Audio", "method": "GET", "path": "/api/jobs/{job_id}/download", "auth": True, "description": "Download audio for a completed job (one-time, file deleted after)"},
         # ── Voice Cloning ─────────────────────────────────────────────────────
         {"group": "VoiceClone", "method": "POST",   "path": "/api/voice_clone/upload",                    "auth": True, "description": "Upload a voice sample (rate: 10/min)"},
         {"group": "VoiceClone", "method": "GET",    "path": "/api/voice_clone/list",                      "auth": True, "description": "List cloned voice profiles"},
@@ -118,10 +114,9 @@ def list_endpoints():
         {"group": "Audio",  "method": "POST", "path": "/api/enhance_audio",        "auth": True, "description": "Apply effects (normalize, fade, reverb, pitch, speed)"},
         {"group": "Audio",  "method": "POST", "path": "/api/transcribe",           "auth": True, "description": "Speech-to-text via local Whisper"},
         # ── Music & Song ──────────────────────────────────────────────────────
-        {"group": "Music",  "method": "POST", "path": "/api/generate_music",       "auth": True, "description": "🎵 Instrumental: prompt+duration  |  🎤 Song: add lyrics+voice_preset+style"},
-        {"group": "Music",  "method": "GET",  "path": "/api/music/options",        "auth": True, "description": "List voice presets, styles, and modes for music/song generation"},
-        {"group": "Music",  "method": "POST", "path": "/api/generate_song",        "auth": True, "description": "Alias for /api/generate_music with lyrics (backwards compat)"},
-        {"group": "Music",  "method": "POST", "path": "/api/generate_music_fal",   "auth": True, "description": "FAL.AI music generation (not yet implemented)"},
+        {"group": "Music",  "method": "POST", "path": "/api/generate_music",       "auth": True, "description": "🎤 Generate full AI song with vocals via ACE-Step 1.5 (lyrics + style + quality)"},
+        {"group": "Music",  "method": "GET",  "path": "/api/music/options",        "auth": True, "description": "List styles and quality presets for song generation"},
+        {"group": "Music",  "method": "POST", "path": "/api/generate_song",        "auth": True, "description": "Alias for /api/generate_music (backwards compat)"},
         # ── Translation ───────────────────────────────────────────────────────
         {"group": "Translation", "method": "POST", "path": "/api/translate",       "auth": True, "description": "Translate text to target language"},
         {"group": "Translation", "method": "GET",  "path": "/api/languages",       "auth": False, "description": "List all supported translation languages"},
