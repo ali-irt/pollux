@@ -75,7 +75,7 @@ def _save_generation(user_id: int, model_label: str, snippet: str) -> int:
     conn.execute("UPDATE users SET generation_count = generation_count + 1 WHERE id = ?", (user_id,))
     cur = conn.execute(
         "INSERT INTO generations (user_id, filename, model, text_snippet, created_at)"
-        " VALUES (?,?,?,?,?) RETURNING id",
+        " VALUES (?,?,?,?,?)",
         (user_id, "", model_label, snippet[:100], now),
     )
     gen_id = cur.lastrowid

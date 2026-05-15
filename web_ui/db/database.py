@@ -1,19 +1,20 @@
 """
 db/database.py
-PostgreSQL connection pool and schema init.
+MySQL connection pool and schema init.
 
-Uses a _PgConn wrapper that exposes the same .execute() / .fetchone() /
+Uses a _MySQLConn wrapper that exposes the same .execute() / .fetchone() /
 .fetchall() / .commit() / .close() API as the old sqlite3 connection, so
-route files need no changes.  Parameter placeholders are auto-converted
-from SQLite's '?' to PostgreSQL's '%s'.
+route files need no changes.  Parameter placeholders ('?') are auto-converted
+to MySQL's '%s'.
 """
 import os
 import threading
+import time
 from pathlib import Path
+from urllib.parse import urlparse
 
-import psycopg2
-import psycopg2.pool
-from psycopg2.extras import RealDictCursor
+import mysql.connector
+import mysql.connector.pooling
 
 # ---------------------------------------------------------------------------
 # Config — read from env, fall back to a localhost default for local dev
@@ -21,47 +22,69 @@ from psycopg2.extras import RealDictCursor
 
 DATABASE_URL: str = os.environ.get(
     "DATABASE_URL",
-    "postgresql://pollux:pollux@localhost:5432/pollux",
+    "mysql://pollux:pollux@localhost:3306/pollux",
 )
 
 # Kept for backwards-compat with anything that imported DB_PATH from db.
 DB_PATH = Path(DATABASE_URL)
 
+
+def _parse_url(url: str) -> dict:
+    p = urlparse(url)
+    return {
+        "host": p.hostname or "localhost",
+        "port": p.port or 3306,
+        "user": p.username or "pollux",
+        "password": p.password or "pollux",
+        "database": (p.path or "/pollux").lstrip("/"),
+    }
+
+
 # ---------------------------------------------------------------------------
 # Connection pool (created once at first use)
 # ---------------------------------------------------------------------------
 
-_pool: psycopg2.pool.ThreadedConnectionPool | None = None
+_pool: mysql.connector.pooling.MySQLConnectionPool | None = None
 _pool_lock = threading.Lock()
 
 
-def _get_pool() -> psycopg2.pool.ThreadedConnectionPool:
+def _get_pool() -> mysql.connector.pooling.MySQLConnectionPool:
     global _pool
     if _pool is not None:
         return _pool
     with _pool_lock:
         if _pool is None:
-            _pool = psycopg2.pool.ThreadedConnectionPool(
-                minconn=2,
-                maxconn=20,
-                dsn=DATABASE_URL,
-            )
+            cfg = _parse_url(DATABASE_URL)
+            retries, delay = 5, 2
+            for attempt in range(retries):
+                try:
+                    _pool = mysql.connector.pooling.MySQLConnectionPool(
+                        pool_name="pollux",
+                        pool_size=20,
+                        pool_reset_session=True,
+                        autocommit=False,
+                        **cfg,
+                    )
+                    break
+                except mysql.connector.Error:
+                    if attempt == retries - 1:
+                        raise
+                    time.sleep(delay * (attempt + 1))
     return _pool
 
 
 # ---------------------------------------------------------------------------
-# _PgConn — thin wrapper that matches the sqlite3 connection API
+# _MySQLConn — thin wrapper that matches the sqlite3 connection API
 # ---------------------------------------------------------------------------
 
-class _PgConn:
-    """Wraps a pooled psycopg2 connection to match the SQLite API used
+class _MySQLConn:
+    """Wraps a pooled mysql-connector connection to match the SQLite API used
     throughout the app.  Call .close() to return the connection to the pool.
     """
 
-    def __init__(self, raw_conn, pool: psycopg2.pool.ThreadedConnectionPool):
+    def __init__(self, raw_conn):
         self._conn = raw_conn
-        self._pool = pool
-        self._cur: psycopg2.extensions.cursor | None = None
+        self._cur = None
 
     # ------------------------------------------------------------------
     # Core API
@@ -69,42 +92,39 @@ class _PgConn:
 
     def execute(self, query: str, params=()):
         """Execute a query.  '?' placeholders are auto-mapped to '%s'."""
-        self._cur = self._conn.cursor(cursor_factory=RealDictCursor)
-        pg_query = query.replace("?", "%s")
-        self._cur.execute(pg_query, params or ())
-        return self  # allow chaining: conn.execute(...).fetchone()
+        self._cur = self._conn.cursor(dictionary=True)
+        self._cur.execute(query.replace("?", "%s"), params or ())
+        return self
 
     def fetchone(self):
         if self._cur is None:
             return None
-        row = self._cur.fetchone()
-        return dict(row) if row is not None else None
+        return self._cur.fetchone()
 
     def fetchall(self):
         if self._cur is None:
             return []
-        return [dict(r) for r in self._cur.fetchall()]
+        return self._cur.fetchall() or []
 
     @property
     def lastrowid(self) -> int | None:
-        """Return the id from the most recent INSERT … RETURNING id."""
         if self._cur is None:
             return None
-        row = self._cur.fetchone()
-        if row is None:
-            return None
-        return row.get("id") or row.get(0)
+        return self._cur.lastrowid
 
     def commit(self):
         self._conn.commit()
 
     def close(self):
-        if self._cur and not self._cur.closed:
-            self._cur.close()
-        self._pool.putconn(self._conn)
+        if self._cur:
+            try:
+                self._cur.close()
+            except Exception:
+                pass
+        self._conn.close()  # returns connection to pool
 
     # ------------------------------------------------------------------
-    # Context manager support (optional but handy)
+    # Context manager support
     # ------------------------------------------------------------------
 
     def __enter__(self):
@@ -122,12 +142,18 @@ class _PgConn:
 # Public helpers
 # ---------------------------------------------------------------------------
 
-def get_db() -> _PgConn:
+def get_db() -> _MySQLConn:
     """Return a pooled connection wrapped in the SQLite-compatible API."""
     pool = _get_pool()
-    raw = pool.getconn()
-    raw.autocommit = False
-    return _PgConn(raw, pool)
+    return _MySQLConn(pool.get_connection())
+
+
+def _try_execute(conn: _MySQLConn, sql: str) -> None:
+    """Run a DDL statement, ignoring duplicate-column / duplicate-index errors."""
+    try:
+        conn.execute(sql)
+    except mysql.connector.Error:
+        pass
 
 
 def init_db():
@@ -136,83 +162,79 @@ def init_db():
         # users
         conn.execute("""
             CREATE TABLE IF NOT EXISTS users (
-                id                SERIAL PRIMARY KEY,
-                email             TEXT UNIQUE NOT NULL,
+                id                INT AUTO_INCREMENT PRIMARY KEY,
+                email             VARCHAR(255) UNIQUE NOT NULL,
                 password_hash     TEXT NOT NULL,
-                plan              TEXT DEFAULT 'free',
-                generation_count  INTEGER DEFAULT 0,
-                credits           INTEGER DEFAULT 50,
-                is_premium        BOOLEAN DEFAULT FALSE,
+                plan              VARCHAR(50) DEFAULT 'free',
+                generation_count  INT DEFAULT 0,
+                credits           INT DEFAULT 50,
+                is_premium        TINYINT(1) DEFAULT 0,
                 created_at        TEXT
-            )
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
         """)
 
-        # generations (metadata only — audio is streamed directly to the client)
+        # generations
         conn.execute("""
             CREATE TABLE IF NOT EXISTS generations (
-                id            SERIAL PRIMARY KEY,
-                user_id       INTEGER NOT NULL REFERENCES users(id),
+                id            INT AUTO_INCREMENT PRIMARY KEY,
+                user_id       INT NOT NULL,
                 filename      TEXT NOT NULL,
                 model         TEXT NOT NULL,
                 text_snippet  TEXT,
-                created_at    TEXT
-            )
+                created_at    TEXT,
+                FOREIGN KEY (user_id) REFERENCES users(id)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
         """)
 
         # failed_login_attempts
         conn.execute("""
             CREATE TABLE IF NOT EXISTS failed_login_attempts (
-                id           SERIAL PRIMARY KEY,
-                email        TEXT NOT NULL,
+                id           INT AUTO_INCREMENT PRIMARY KEY,
+                email        VARCHAR(255) NOT NULL,
                 attempt_time TEXT NOT NULL,
                 ip_address   TEXT
-            )
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
         """)
 
         # locked_accounts
         conn.execute("""
             CREATE TABLE IF NOT EXISTS locked_accounts (
-                email        TEXT PRIMARY KEY,
+                email        VARCHAR(255) PRIMARY KEY,
                 locked_until TEXT NOT NULL
-            )
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
         """)
 
         # cloned_voices
         conn.execute("""
             CREATE TABLE IF NOT EXISTS cloned_voices (
-                id                 SERIAL PRIMARY KEY,
-                user_id            INTEGER NOT NULL REFERENCES users(id),
+                id                 INT AUTO_INCREMENT PRIMARY KEY,
+                user_id            INT NOT NULL,
                 name               TEXT NOT NULL,
                 reference_filename TEXT NOT NULL,
-                created_at         TEXT
-            )
+                created_at         TEXT,
+                FOREIGN KEY (user_id) REFERENCES users(id)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
         """)
 
         # jobs
         conn.execute("""
             CREATE TABLE IF NOT EXISTS jobs (
-                id            TEXT PRIMARY KEY,
-                user_id       INTEGER NOT NULL REFERENCES users(id),
+                id            VARCHAR(191) PRIMARY KEY,
+                user_id       INT NOT NULL,
                 type          TEXT NOT NULL,
-                status        TEXT DEFAULT 'pending',
-                generation_id INTEGER,
+                status        VARCHAR(50) DEFAULT 'pending',
+                generation_id INT,
                 result_path   TEXT,
                 error_message TEXT,
                 created_at    TEXT,
-                updated_at    TEXT
-            )
-        """)
-        # Migration: add result_path to existing tables that predate this column
-        conn.execute("""
-            ALTER TABLE jobs ADD COLUMN IF NOT EXISTS result_path TEXT
+                updated_at    TEXT,
+                FOREIGN KEY (user_id) REFERENCES users(id)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
         """)
 
-        # indexes for hot query paths
-        conn.execute("""
-            CREATE INDEX IF NOT EXISTS idx_jobs_user_status
-                ON jobs (user_id, status)
-        """)
-        conn.execute("""
-            CREATE INDEX IF NOT EXISTS idx_generations_user
-                ON generations (user_id, created_at DESC)
-        """)
+        # Migration: add result_path for tables predating this column
+        _try_execute(conn, "ALTER TABLE jobs ADD COLUMN result_path TEXT")
+
+        # Indexes
+        _try_execute(conn, "CREATE INDEX idx_jobs_user_status ON jobs (user_id, status)")
+        _try_execute(conn, "CREATE INDEX idx_generations_user ON generations (user_id, created_at(100))")

@@ -93,7 +93,7 @@ def register(req: RegisterRequest, request: Request):
     now = datetime.utcnow().isoformat()
     cursor = conn.execute(
         "INSERT INTO users (email, password_hash, plan, generation_count, credits, is_premium, created_at)"
-        " VALUES (?, ?, 'free', 0, ?, ?, ?) RETURNING id",
+        " VALUES (?, ?, 'free', 0, ?, ?, ?)",
         (
             req.email,
             hash_password(req.password),
