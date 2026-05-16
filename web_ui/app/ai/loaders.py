@@ -83,7 +83,7 @@ def _is_hf_cached(repo_id: str) -> bool:
 _ace_step_pipeline = None
 _ace_step_lock = threading.Lock()
 
-_ACE_STEP_MODEL_ID = "stepfun-ai/ACE-Step-v1.5-3.5B"
+_ACE_STEP_MODEL_ID = "ACE-Step/Ace-Step1.5"
 
 
 def _load_ace_step():

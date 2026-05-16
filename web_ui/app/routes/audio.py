@@ -43,9 +43,10 @@ def download_job_audio(job_id: str, user=Depends(get_current_user)):
     except Exception:
         pass
 
+    media_type = "audio/mpeg" if path.suffix == ".mp3" else "audio/wav"
     logger.info("Job %s audio downloaded by user %s", job_id, user["id"])
     return Response(
         content=audio_bytes,
-        media_type="audio/wav",
+        media_type=media_type,
         headers={"Content-Disposition": f"attachment; filename={path.name}"},
     )

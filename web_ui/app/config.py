@@ -112,8 +112,8 @@ WHISPER_ALLOWED_SIZES = {"tiny", "base", "small"}
 # Song generation constants (ACE-Step 1.5)
 # ---------------------------------------------------------------------------
 
-MAX_SONG_LYRICS_LENGTH = 800
-ACE_STEP_MODEL_ID = "stepfun-ai/ACE-Step-v1.5-3.5B"
+MAX_SONG_LYRICS_LENGTH = 5000
+ACE_STEP_MODEL_ID = "ACE-Step/Ace-Step1.5"
 ACE_STEP_LOCAL_DIR = MODELS_DIR / "ace-step-1.5"
 ACE_STEP_MAX_DURATION = 240  # seconds
 
@@ -134,6 +134,11 @@ ACE_STEP_STYLE_TAGS = {
     "metal":      "heavy metal, down-tuned guitar riffs, blast beats, aggressive screaming vocals, brutal",
     "lofi":       "lo-fi hip hop, chill beats, vinyl crackle, mellow chords, relaxing, study music",
     "latin":      "latin pop, salsa, percussion, trumpet, infectious groove, passionate vocals",
+    "qawwali":    "qawwali, sufi, harmonium, tabla, Pakistani devotional, call and response vocals, urdu",
+    "ghazal":     "ghazal, urdu poetry, classical vocals, intimate, sitar, tabla, melancholic, Pakistani",
+    "pakistani_pop": "Pakistani pop, urdu vocals, melodic, dholak, contemporary South Asian production",
+    "bollywood":  "bollywood, Indian film music, orchestral, emotional hindi vocals, dramatic, lush strings",
+    "punjabi":    "punjabi, bhangra, dhol drums, energetic, folk vocals, desi beat, festive",
 }
 
 # Inference quality presets: (infer_step, scheduler_type, guidance_scale)

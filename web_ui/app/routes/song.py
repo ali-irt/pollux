@@ -27,6 +27,7 @@ class SongGenerateRequest(BaseModel):
     style: str = "pop"
     audio_duration: int = 60
     quality: str = "balanced"
+    language: str = "english"  # e.g. english, urdu, hindi, spanish, french
 
 
 @router.post("/api/generate_song", summary="Generate a full AI song with vocals via ACE-Step 1.5")
@@ -52,7 +53,7 @@ def generate_song(request: SongGenerateRequest, user=Depends(get_current_user)):
     _job_executor.submit(
         _job_generate_song,
         job_id, user["id"], request.lyrics, request.style,
-        request.audio_duration, request.quality,
+        request.audio_duration, request.quality, request.language,
     )
     logger.info(
         "Song job %s queued for user %s (style=%s, quality=%s, duration=%ds)",

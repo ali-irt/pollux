@@ -30,6 +30,7 @@ class SongGenerateRequest(BaseModel):
     style: str = "pop"
     audio_duration: int = 30   # seconds (10–240); keep short on CPU
     quality: str = "fast"      # turbo | fast | balanced | best
+    language: str = "english"  # e.g. english, urdu, hindi, spanish, french
 
 
 @router.post("/api/generate_music", summary="Generate a full AI song with vocals via ACE-Step 1.5 (returns job_id)")
@@ -58,11 +59,11 @@ def generate_music(request: SongGenerateRequest, user=Depends(get_current_user))
     _job_executor.submit(
         _job_generate_song,
         job_id, user["id"], request.lyrics, request.style,
-        request.audio_duration, request.quality,
+        request.audio_duration, request.quality, request.language,
     )
     logger.info(
-        "Song job %s queued for user %s (style=%s, quality=%s, duration=%ds)",
-        job_id, user["email"], request.style, request.quality, request.audio_duration,
+        "Song job %s queued for user %s (style=%s, quality=%s, duration=%ds, lang=%s)",
+        job_id, user["email"], request.style, request.quality, request.audio_duration, request.language,
     )
     return {"job_id": job_id, "status": "pending", "poll_url": f"/api/jobs/{job_id}"}
 

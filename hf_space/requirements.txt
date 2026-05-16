@@ -1,0 +1,8 @@
+gradio>=4.44.1
+fastapi
+uvicorn[standard]
+pydantic
+git+https://github.com/ace-step/ACE-Step.git
+huggingface_hub
+soundfile
+scipy

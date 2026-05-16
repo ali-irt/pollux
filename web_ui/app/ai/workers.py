@@ -95,38 +95,98 @@ def _format_lyrics(raw: str) -> str:
 # ---------------------------------------------------------------------------
 
 
+def _call_remote_ace_step(endpoint: str, payload: dict, out_path: Path) -> None:
+    """POST to remote ACE-Step server, poll until done, save the WAV."""
+    import requests, time
+    base = endpoint.rstrip("/")
+    r = requests.post(f"{base}/generate", json=payload, timeout=30)
+    r.raise_for_status()
+    job_id = r.json()["job_id"]
+    for _ in range(120):  # poll up to 10 minutes
+        time.sleep(5)
+        poll = requests.get(f"{base}/result/{job_id}", timeout=30)
+        poll.raise_for_status()
+        if poll.headers.get("content-type", "").startswith("audio/"):
+            out_path.write_bytes(poll.content)
+            return
+        status = poll.json().get("status")
+        if status == "failed":
+            raise RuntimeError(f"Remote ACE-Step job failed: {poll.json().get('error')}")
+    raise TimeoutError("Remote ACE-Step job timed out after 10 minutes")
+
+
 def _job_generate_song(job_id: str, user_id: int, lyrics: str, style: str,
-                       audio_duration: int, quality: str = "balanced"):
+                       audio_duration: int, quality: str = "balanced", language: str = "english"):
+    import os
     _update_job(job_id, "processing")
     tmp_path = None
     try:
-        pipeline = _load_ace_step()
         style_prompt = ACE_STEP_STYLE_TAGS.get(style, f"{style}, vocals, music")
+        _LANGUAGE_ACCENT_TAGS = {
+            "urdu":    "urdu vocals, Pakistani accent, South Asian inflection",
+            "hindi":   "hindi vocals, Indian accent, Bollywood inflection",
+            "punjabi": "punjabi vocals, bhangra accent, desi",
+            "arabic":  "arabic vocals, Middle Eastern maqam, melismatic",
+            "spanish": "spanish vocals, Latin accent, passionate",
+            "french":  "french vocals, chanson style, Parisian accent",
+            "korean":  "korean vocals, K-pop style",
+            "japanese": "japanese vocals, J-pop style",
+        }
+        accent_tags = _LANGUAGE_ACCENT_TAGS.get(language.lower())
+        if accent_tags:
+            style_prompt = f"{style_prompt}, {accent_tags}"
+        elif language.lower() != "english":
+            style_prompt = f"{style_prompt}, {language.lower()} vocals"
         formatted_lyrics = _format_lyrics(lyrics)
         infer_step, scheduler_type, guidance_scale = ACE_STEP_QUALITY_PRESETS.get(
             quality, ACE_STEP_QUALITY_PRESETS["balanced"]
         )
-
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tf:
-            tmp_path = tf.name
-
-        import torch
         extra = _QUALITY_PIPELINE_KWARGS.get(quality, {})
-        with torch.inference_mode():
-            pipeline(
-                audio_duration=audio_duration,
-                prompt=style_prompt,
-                lyrics=formatted_lyrics,
-                infer_step=infer_step,
-                guidance_scale=guidance_scale,
-                scheduler_type=scheduler_type,
-                save_path=tmp_path,
-                **extra,
-            )
-
         out_path = OUTPUTS_DIR / f"{job_id}.wav"
-        Path(tmp_path).rename(out_path)
-        tmp_path = None  # renamed, no longer needs cleanup
+
+        remote = os.environ.get("ACE_STEP_ENDPOINT", "").strip()
+        if remote:
+            _call_remote_ace_step(remote, {
+                "audio_duration": audio_duration,
+                "prompt": style_prompt,
+                "lyrics": formatted_lyrics,
+                "infer_step": infer_step,
+                "guidance_scale": guidance_scale,
+                "scheduler_type": scheduler_type,
+                **extra,
+            }, out_path)
+        else:
+            pipeline = _load_ace_step()
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tf:
+                tmp_path = tf.name
+            import torch
+            with torch.inference_mode():
+                pipeline(
+                    audio_duration=audio_duration,
+                    prompt=style_prompt,
+                    lyrics=formatted_lyrics,
+                    infer_step=infer_step,
+                    guidance_scale=guidance_scale,
+                    scheduler_type=scheduler_type,
+                    save_path=tmp_path,
+                    **extra,
+                )
+            Path(tmp_path).rename(out_path)
+            tmp_path = None
+
+        # Convert WAV → MP3
+        mp3_path = out_path.with_suffix(".mp3")
+        try:
+            import subprocess
+            ffmpeg = resolve_bin("ffmpeg")
+            subprocess.run(
+                [ffmpeg, "-y", "-i", str(out_path), "-q:a", "2", str(mp3_path)],
+                check=True, capture_output=True,
+            )
+            out_path.unlink(missing_ok=True)
+            out_path = mp3_path
+        except Exception as conv_err:
+            logger.warning("MP3 conversion failed, keeping WAV: %s", conv_err)
 
         gen_id = _save_generation(user_id, f"ace-step-1.5:{style}", lyrics)
         _update_job(job_id, "done", generation_id=gen_id, result_path=str(out_path))

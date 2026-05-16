@@ -23,7 +23,6 @@ from slowapi.util import get_remote_address
 
 from app.config import ALLOWED_ORIGINS, BASE_DIR
 from app.ai.loaders import (
-    _prefetch_ace_step_model,
     _prefetch_xtts_model,
     _prefetch_whisper_model,
 )
@@ -60,7 +59,7 @@ async def lifespan(_app: FastAPI):
         logger.info(f"Torch CPU threads set to {n}")
     except Exception:
         pass
-    threading.Thread(target=_prefetch_ace_step_model, daemon=True).start()
+    # ACE-Step (~12 GB) is too large to prefetch on this server — load on demand only
     threading.Thread(target=_prefetch_xtts_model, daemon=True).start()
     threading.Thread(target=_prefetch_whisper_model, daemon=True).start()
 
