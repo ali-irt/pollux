@@ -50,6 +50,7 @@ if not JWT_SECRET or len(JWT_SECRET) < 32:
 
 JWT_ALGORITHM = os.environ.get("JWT_ALGORITHM", "HS256")
 BASE_URL = os.environ.get("BASE_URL", "http://localhost:8000")
+GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "")
 
 # ---------------------------------------------------------------------------
 # Credits & plans

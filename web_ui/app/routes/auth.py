@@ -15,7 +15,7 @@ from pydantic import BaseModel
 from slowapi import Limiter
 from slowapi.util import get_remote_address
 
-from app.config import INITIAL_FREE_CREDITS, _WEBHOOK_SECRET
+from app.config import INITIAL_FREE_CREDITS, _WEBHOOK_SECRET, GOOGLE_CLIENT_ID
 from app.security import (
     create_token,
     create_refresh_token,
@@ -61,6 +61,10 @@ class RefreshTokenRequest(BaseModel):
 class ChangePasswordRequest(BaseModel):
     current_password: str
     new_password: str
+
+
+class GoogleAuthRequest(BaseModel):
+    id_token: str
 
 
 # ---------------------------------------------------------------------------
@@ -270,6 +274,73 @@ def upgrade_to_premium(user=Depends(get_current_user)):
         "plan": "premium",
         "is_premium": True,
         "credits": -1,
+    }
+
+
+@router.post("/api/auth/google", summary="Sign in with Google ID token")
+@limiter.limit("10/minute")
+def google_auth(req: GoogleAuthRequest, request: Request):
+    if not GOOGLE_CLIENT_ID:
+        raise HTTPException(status_code=501, detail="Google auth is not configured on this server.")
+
+    # Verify the ID token against Google's public keys
+    try:
+        from google.oauth2 import id_token as google_id_token
+        from google.auth.transport import requests as google_requests
+        id_info = google_id_token.verify_oauth2_token(
+            req.id_token,
+            google_requests.Request(),
+            GOOGLE_CLIENT_ID,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=401, detail=f"Invalid Google token: {e}")
+    except Exception as e:
+        logger.error(f"Google token verification failed: {e}")
+        raise HTTPException(status_code=401, detail="Google token verification failed.")
+
+    email = id_info.get("email", "").lower().strip()
+    if not email or not id_info.get("email_verified"):
+        raise HTTPException(status_code=400, detail="Google account has no verified email.")
+
+    conn = get_db()
+    now = datetime.utcnow().isoformat()
+
+    user = conn.execute("SELECT * FROM users WHERE email = ?", (email,)).fetchone()
+
+    if user:
+        # Existing user — return tokens
+        u = dict(user)
+    else:
+        # New user — create account (no password for Google users)
+        cursor = conn.execute(
+            "INSERT INTO users (email, password_hash, plan, generation_count, credits, is_premium, created_at)"
+            " VALUES (?, ?, 'free', 0, ?, ?, ?)",
+            (email, "__google_oauth__", INITIAL_FREE_CREDITS, False, now),
+        )
+        conn.commit()
+        u = conn.execute("SELECT * FROM users WHERE id = ?", (cursor.lastrowid,)).fetchone()
+        u = dict(u)
+        logger.info(f"New user via Google: {email}")
+
+    conn.commit()
+    conn.close()
+
+    access_token  = create_token(u["id"], u["email"])
+    refresh_token = create_refresh_token(u["id"], u["email"])
+    logger.info(f"Google login: {email}")
+
+    return {
+        "access_token":  access_token,
+        "refresh_token": refresh_token,
+        "token_type":    "bearer",
+        "user": {
+            "email":                 u["email"],
+            "plan":                  u["plan"],
+            "generation_count":      u["generation_count"],
+            "credits":               u["credits"],
+            "is_premium":            bool(u["is_premium"]),
+            "generations_remaining": user_remaining(u),
+        },
     }
 
 
