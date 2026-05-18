@@ -38,6 +38,7 @@ from app.routes import (
     enhance,
     stats,
     voxcpm,
+    voice_clone,
 )
 from db import init_db
 
@@ -199,6 +200,7 @@ app.include_router(translate.router)
 app.include_router(enhance.router)
 app.include_router(stats.router)
 app.include_router(voxcpm.router)
+app.include_router(voice_clone.router)
 
 # ---------------------------------------------------------------------------
 # Static files (must be mounted after all API routes)
