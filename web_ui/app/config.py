@@ -195,6 +195,14 @@ VOXCPM_ALLOWED_EXT = {".wav", ".mp3", ".ogg", ".flac", ".m4a"}
 _WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
 
 # ---------------------------------------------------------------------------
+# Stripe
+# ---------------------------------------------------------------------------
+
+STRIPE_SECRET_KEY = os.environ.get("STRIPE_SECRET_KEY", "")
+STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "")
+STRIPE_PREMIUM_PRICE_CENTS = 500  # $5.00
+
+# ---------------------------------------------------------------------------
 # Database
 # ---------------------------------------------------------------------------
 

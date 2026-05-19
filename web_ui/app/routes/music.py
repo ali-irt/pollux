@@ -35,6 +35,12 @@ class SongGenerateRequest(BaseModel):
 
 @router.post("/api/generate_music", summary="Generate a full AI song with vocals via ACE-Step 1.5 (returns job_id)")
 def generate_music(request: SongGenerateRequest, user=Depends(get_current_user)):
+    if not user["is_premium"]:
+        raise HTTPException(
+            status_code=403,
+            detail="Song generation is a premium feature. Upgrade at /api/payments/create-checkout.",
+        )
+
     if not request.lyrics or not request.lyrics.strip():
         raise HTTPException(status_code=400, detail="Lyrics cannot be empty.")
     if len(request.lyrics) > MAX_SONG_LYRICS_LENGTH:
